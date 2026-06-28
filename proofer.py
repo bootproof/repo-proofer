@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -1277,9 +1277,18 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
             # Extract dependencies from pyproject.toml ON THE HOST (not
             # inside Docker — avoids inline Python quoting hell). Write
             # them to a requirements-style file in the repo dir so Docker
-            # can read it. Then install ONLY the deps, not the package
-            # itself, to avoid the source-vs-installed shadowing conflict
-            # (the FastAPI RuntimeError fix).
+            # can read it. Then install BOTH the deps AND the package
+            # itself to /tmp/pip_deps.
+            #
+            # Why install the package too? Because FastAPI's cli.py calls
+            # importlib.metadata.distribution("fastapi"), which requires
+            # a .dist-info directory. The source checkout at /app/fastapi/
+            # provides the CODE (importable via cwd), but not the metadata.
+            # Installing the package to /tmp/pip_deps (with --no-deps so
+            # we don't re-download deps) creates the .dist-info, which
+            # satisfies the metadata check. The source shadows the installed
+            # copy for imports (same code), but importlib.metadata finds
+            # the dist-info via PYTHONPATH.
             deps = _extract_pyproject_deps(repo_path / "pyproject.toml")
             if deps:
                 # Write deps to a temp file in the repo (mounted :ro in
@@ -1292,10 +1301,14 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
                     deps_file = None
 
                 if deps_file:
+                    # Two-step install: deps first, then package (--no-deps
+                    # so deps aren't re-downloaded). Both go to /tmp/pip_deps.
                     install_cmd = [
-                        "pip", "install", "--no-cache-dir", "--prefer-binary",
-                        "-r", ".repo-proofer-deps.txt",
-                        "-t", "/tmp/pip_deps",
+                        "sh", "-c",
+                        "pip install --no-cache-dir --prefer-binary "
+                        "-r .repo-proofer-deps.txt -t /tmp/pip_deps "
+                        "&& pip install --no-cache-dir --no-deps "
+                        "-t /tmp/pip_deps .",
                     ]
                 else:
                     # Couldn't write the file — fall back
