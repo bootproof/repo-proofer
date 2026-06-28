@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw

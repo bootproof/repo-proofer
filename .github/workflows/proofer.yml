@@ -1,0 +1,117 @@
+# .github/workflows/proofer.yml
+#
+# Runs repo-proofer on every push/PR and comments the verdict on the PR.
+# This is the "put it where the pain is" step — the verdict shows up at
+# the moment of decision (reviewing a PR), not in a separate ritual.
+#
+# On a Linux runner with bubblewrap + strace, each run takes ~2 seconds
+# with no Docker-in-Docker needed. The native sandbox is perfect for CI.
+#
+# To use in your own repo: copy this file to .github/workflows/proofer.yml.
+# No secrets required — runs entirely on the public PyPI package.
+
+name: repo-proofer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  proof:
+    name: Run repo-proofer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # to comment the verdict on PRs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bubblewrap + strace
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap strace
+
+      - name: Run repo-proofer on the current repo
+        id: proofer
+        run: |
+          # Run repo-proofer against the checked-out repo.
+          # --sandbox native forces the fast bubblewrap path (no Docker).
+          # Capture the full output for the PR comment.
+          set +e
+          uvx repo-proofer --sandbox native "file://$(pwd)" > proofer-output.txt 2>&1
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+
+          # Print to the Actions log so it's visible without the comment.
+          cat proofer-output.txt
+
+          # Escape the output for the PR comment (multi-line, special chars).
+          {
+            echo "verdict<<EOF"
+            cat proofer-output.txt
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Comment verdict on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = `${{ steps.proofer.outputs.verdict }}`;
+            const exitCode = `${{ steps.proofer.outputs.exit_code }}`;
+            const verdictEmoji = exitCode === '0' ? '✅' : '🚫';
+            const verdictLabel = exitCode === '0'
+              ? 'BOOTS: YES (or library)'
+              : 'BOOTS: NO (crash or sensitive access)';
+
+            const body = [
+              `### ${verdictEmoji} repo-proofer verdict`,
+              '',
+              `**${verdictLabel}** — exit code \`${exitCode}\``,
+              '',
+              '<details><summary>Full output</summary>',
+              '',
+              '```',
+              output,
+              '```',
+              '',
+              '</details>',
+              '',
+              '_Automated by [repo-proofer](https://github.com/bootproof/repo-proofer) — runs untrusted code in a zero-network, read-only sandbox and reports what it actually did._'
+            ].join('\n');
+
+            // Find and update existing comment, or create new one.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('repo-proofer verdict')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail the check if repo-proofer flags slop
+        if: steps.proofer.outputs.exit_code == '1'
+        run: |
+          echo "repo-proofer flagged this repo (BOOTS: NO or sensitive access)."
+          echo "See the PR comment for the full verdict."
+          exit 1

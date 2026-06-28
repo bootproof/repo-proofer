@@ -73,7 +73,18 @@ cd repo-proofer
 pip install -e .
 ```
 
-Requires Python 3.10+. The native sandbox (default on Linux) needs `bubblewrap` — install it with `apt install bubblewrap` (Debian/Ubuntu) or `dnf install bubblewrap` (Fedora). No Docker needed.
+Requires Python 3.10+.
+
+**On Linux (zero-setup, instant):** install `bubblewrap` and `strace` — both are required for the native sandbox and exfil detection:
+
+```bash
+sudo apt install bubblewrap strace   # Debian/Ubuntu
+sudo dnf install bubblewrap strace   # Fedora
+```
+
+Then `uvx repo-proofer <url>` runs in ~1.5 seconds with no Docker daemon, no image pulls. This is the recommended path.
+
+**On macOS / Windows:** the native sandbox isn't available (bubblewrap is Linux-only). `--sandbox auto` falls back to Docker — run `repo-proofer <url>` with Docker Desktop running. First run pulls images (~minutes); subsequent runs are fast.
 
 ## Documentation
 
@@ -218,6 +229,7 @@ This tool is honest about what it can and can't do.
 - **Hostname-based C2 detection is indirect.** Under `--network none`, DNS resolution fails *before* `connect()`, so a hostname-based egress target shows up as a DNS query to the resolver, not the actual hostname. Hardcoded-IP malware produces a clean `connect <IP>:<port>` line. The **Sensitive File Access** list is the strong, unambiguous signal regardless.
 - **Install-phase residual risk.** The install phase runs with network ON (it has to, to fetch packages). npm's supply-chain window is closed with `--ignore-scripts`; pip is pushed toward wheels with `--prefer-binary`. sdist-only packages still trigger a PEP 517 build — a known residual risk.
 - **Native sandbox is Linux-only.** Bubblewrap doesn't exist on macOS/Windows. On those platforms, `--sandbox auto` falls back to Docker. The native sandbox also has no memory/CPU limits — use `--sandbox docker` for the full isolation profile.
+- **Speed vs. isolation tradeoff.** The default `--sandbox auto` prefers the native bubblewrap sandbox (fast, no Docker) over Docker (clean-room isolation, cgroup limits). For "is this slop / does it phone home," native is a reasonable trade. For "this might be targeted malware aimed at me," use `--sandbox docker` for full container isolation with a separate kernel namespace and seccomp profile.
 
 ## FAQ
 

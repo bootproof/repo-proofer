@@ -918,6 +918,54 @@ def test_parse_unix_socket_recorded():
     print("[OK] parse_strace_output: AF_UNIX connect recorded")
 
 
+def test_parse_no_duplicate_from_bare_trace_file():
+    """Regression test: glob 'trace.*' must NOT match a bare 'trace' file.
+
+    The old glob 'trace*' matched both 'trace.1234' (per-pid) and 'trace'
+    (combined output if one exists). If strace wrote both, every syscall
+    was double-counted — the report rendered duplicated. This test creates
+    a bare 'trace' file alongside per-pid files and verifies NO duplication.
+    """
+    d = Path(tempfile.mkdtemp(prefix="trace-dup-"))
+    # Per-pid file with the real syscall
+    _write_trace(d, "trace.100", [
+        'execve("/usr/local/bin/python3", ["python3", "main.py"], ...) = 0',
+        'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT',
+        '+++ exited with 0 +++',
+    ])
+    # Bare 'trace' file (combined output — should be IGNORED if per-pid exist)
+    _write_trace(d, "trace", [
+        'execve("/usr/local/bin/python3", ["python3", "main.py"], ...) = 0',
+        'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT',
+        '+++ exited with 0 +++',
+    ])
+    r = parse_strace_output(d)
+    # Must see the sensitive path exactly once — not twice.
+    assert r.sensitive_access.count("/root/.ssh/id_rsa") == 1, \
+        f"Expected exactly 1 sensitive path, got {r.sensitive_access} (duplication bug!)"
+    # Must see exactly 1 process spawn — not twice.
+    assert r.processes_spawned.count("/usr/local/bin/python3") == 1, \
+        f"Expected exactly 1 process, got {r.processes_spawned} (duplication bug!)"
+    print("[OK] parse_strace_output: bare 'trace' file ignored when per-pid exist (no duplication)")
+
+
+def test_parse_bare_trace_fallback():
+    """If ONLY a bare 'trace' file exists (no per-pid), parse it.
+    Some strace versions/modes write a single combined file. The parser
+    should fall back to it rather than returning an empty report."""
+    d = Path(tempfile.mkdtemp(prefix="trace-bare-"))
+    _write_trace(d, "trace", [
+        'execve("/usr/local/bin/python3", ["python3", "main.py"], ...) = 0',
+        'openat(AT_FDCWD, "/app/main.py", O_RDONLY) = 3',
+        '+++ exited with 0 +++',
+    ])
+    r = parse_strace_output(d)
+    assert r.processes_spawned == ["/usr/local/bin/python3"], \
+        f"Should parse bare trace file, got {r.processes_spawned}"
+    assert "/app/main.py" in r.files_read
+    print("[OK] parse_strace_output: bare 'trace' file parsed when no per-pid exist")
+
+
 def test_behavior_report_has_data_property():
     empty = BehaviorReport()
     assert empty.has_data is False
@@ -1191,6 +1239,8 @@ def run_all():
     test_parse_malformed_lines_ignored()
     test_parse_ipv6_attempt()
     test_parse_unix_socket_recorded()
+    test_parse_no_duplicate_from_bare_trace_file()
+    test_parse_bare_trace_fallback()
     test_behavior_report_has_data_property()
 
     print()
