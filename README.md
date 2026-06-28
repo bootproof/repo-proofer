@@ -1,11 +1,20 @@
 # repo-proofer
 
-[![CI](https://github.com/bootproof/repo-proofer/actions/workflows/ci.yml/badge.svg)](https://github.com/bootproof/repo-proofer/actions)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyPI](https://img.shields.io/pypi/v/repo-proofer.svg)](https://pypi.org/project/repo-proofer/)
+<p align="center">
+  <strong>Find out if a repo will steal your keys before you run it.</strong>
+</p>
 
-Find out if a repo will steal your keys before you run it.
+<p align="center">
+  <a href="https://pypi.org/project/repo-proofer/"><img src="https://img.shields.io/pypi/v/repo-proofer.svg?color=blue&label=PyPI&cacheSeconds=0" alt="PyPI"></a>
+  <a href="https://pypi.org/project/repo-proofer/"><img src="https://img.shields.io/pypi/dm/repo-proofer.svg?color=blue&label=downloads&cacheSeconds=0" alt="PyPI downloads"></a>
+  <a href="https://pypi.org/project/repo-proofer/"><img src="https://img.shields.io/pypi/pyversions/repo-proofer.svg?color=blue&cacheSeconds=0" alt="Python versions"></a>
+  <a href="https://github.com/bootproof/repo-proofer/actions"><img src="https://github.com/bootproof/repo-proofer/actions/workflows/ci.yml/badge.svg?cacheSeconds=0" alt="CI"></a>
+  <a href="https://github.com/bootproof/repo-proofer/actions"><img src="https://github.com/bootproof/repo-proofer/actions/workflows/proofer.yml/badge.svg?cacheSeconds=0" alt="repo-proofer"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?cacheSeconds=0" alt="License"></a>
+  <a href="https://github.com/bootproof/repo-proofer"><img src="https://img.shields.io/github/stars/bootproof/repo-proofer.svg?style=social&cacheSeconds=0" alt="GitHub stars"></a>
+</p>
+
+---
 
 GitHub is flooded with AI-generated "slop" — repositories with impressive READMEs that don't actually run, or worse, quietly phone home to a C2 server the moment you `npm install` them. `repo-proofer` clones a repo, drops it into a zero-network, read-only sandbox, executes it, and tells you — deterministically, no AI — whether it booted and whether it tried to read your SSH keys.
 
