@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -765,7 +765,10 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
         return StackProfile(
             name="Ruby (Rails)",
             image="ruby:3.3-slim",
-            install_cmd=["bundle", "install", "--path", "/tmp/bundle"],
+            install_cmd=[
+                "sh", "-c",
+                "bundle config set path /tmp/bundle && bundle install",
+            ],
             run_candidates=[
                 # Try the Rails server entrypoint.
                 ["bundle", "exec", "rails", "server", "-b", "0.0.0.0"],
@@ -1654,16 +1657,21 @@ def analyze_result(
         #         segfault, panic, exit 1 from running code).
         boots = False
         # ---- Install-failure-first check ----
-        # When install failed AND execution fails with 127 (command not
-        # found), the install failure is the ROOT CAUSE — the 127 is just
-        # its shadow. The command wasn't found because it was never
+        # When install failed AND execution fails, the install failure is
+        # the ROOT CAUSE — the exec failure is just its shadow. The
+        # command wasn't found (or crashed) because deps were never
         # installed. Lead with the install failure, not the downstream
         # exit code. (The GitLab case: bundle install failed → rails
-        # never installed → exit 127. The honest verdict leads with
-        # "install failed", not "crash" or even "command not found".)
+        # never installed → bundler exits non-zero. The honest verdict
+        # leads with "install failed", not "crash" or "command not found".)
+        #
+        # This fires on ANY non-zero exec exit when install failed — not
+        # just 127 — because bundler/ruby may exit with different codes
+        # than sh/bash. The key signal is "install failed + exec failed"
+        # = environment failure, not app crash.
         if (install_result is not None
                 and install_result.exit_code != 0
-                and result.exit_code == 127):
+                and result.exit_code != 0):
             missing_cmd = _extract_missing_command(result.stderr)
             cmd_part = f", '{missing_cmd}' unavailable" if missing_cmd else ""
             detail = (

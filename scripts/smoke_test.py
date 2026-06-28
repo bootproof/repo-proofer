@@ -684,6 +684,36 @@ def test_analyze_install_failure_leads_verdict():
     print("[OK] analyze_result: install failure + 127 -> leads with 'install failed'")
 
 
+def test_analyze_install_failure_leads_on_non_127_exit():
+    """When install failed AND execution fails with a NON-127 exit code,
+    the install failure is still the root cause. Bundler/Ruby may exit
+    with 1 (not 127) when it can't find a command — the old check only
+    fired on 127, so GitLab's verdict fell through to 'crash'. Now the
+    check fires on ANY non-zero exec exit when install failed.
+    """
+    install_result = ExecutionResult(
+        stdout="",
+        stderr="ERROR: --path flag is deprecated",
+        exit_code=15,
+    )
+    exec_result = ExecutionResult(
+        stdout="",
+        stderr="bundler: command not found: rails",
+        exit_code=1,  # NOT 127 — bundler exits with 1
+    )
+    v = analyze_result(exec_result, install_result=install_result)
+    assert v.boots is False
+    assert "install failed" in v.detail, \
+        f"Should lead with 'install failed' even on non-127 exit, got {v.detail}"
+    assert "exit 15" in v.detail, \
+        f"Should include install exit code, got {v.detail}"
+    assert "rails" in v.detail, \
+        f"Should extract 'rails' from bundler stderr, got {v.detail}"
+    assert "crash" not in v.detail.lower(), \
+        f"Install failure is NOT a crash, got {v.detail}"
+    print("[OK] analyze_result: install failure + exit 1 (non-127) -> leads with 'install failed'")
+
+
 def test_analyze_exit_127_no_command_extracted():
     """Exit 127 with unparseable stderr should still say 'failed to start'."""
     r = ExecutionResult(
@@ -1519,6 +1549,7 @@ def run_all():
     test_analyze_exit_127_command_not_found()
     test_analyze_exit_127_bundler_command_not_found()
     test_analyze_install_failure_leads_verdict()
+    test_analyze_install_failure_leads_on_non_127_exit()
     test_analyze_exit_127_no_command_extracted()
     test_analyze_missing_script_not_crash()
     test_analyze_network_error_node()
