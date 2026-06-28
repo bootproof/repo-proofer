@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.9"
+__version__ = "0.6.0"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -129,6 +129,8 @@ NOT_FOUND_MARKERS = [
     "no module named",       # Python ImportError
     "could not find a default file",  # FastAPI: no app file in the repo
     "please provide an explicit path", # FastAPI: needs an app path
+    "arguments are required", # argparse: needs a subcommand (actenon, etc.)
+    "error: the following arguments are required",  # argparse variant
 ]
 
 # ----------------------------------------------------------------------
@@ -1205,6 +1207,12 @@ def _detect_python_entrypoints(repo_path: Path) -> list[list[str]]:
     console_scripts.update(_parse_setup_py_console_scripts(repo_path))
     for name, target in sorted(console_scripts.items()):
         candidates.append(_resolve_console_script(name, target))
+        # Also try --help as a fallback. Many multi-command CLIs (actenon,
+        # fastapi, django) require a subcommand and exit 2 if none is
+        # given. `--help` exits 0 and proves the CLI loaded successfully
+        # with all dependencies resolved. That's a valid BOOTS: YES for
+        # a CLI tool — it booted and responded to a command.
+        candidates.append(_resolve_console_script(name, target) + ["--help"])
 
     # Dedup while preserving order.
     seen: set[tuple[str, ...]] = set()
@@ -2206,7 +2214,11 @@ def analyze_result(
     # ---- Determine boots + detail ----
     if result.exit_code == 0:
         boots = True
-        detail = "exited 0"
+        # Check if this was a --help run (CLI loaded successfully)
+        if "usage:" in combined_lower or "--help" in combined_lower:
+            detail = "CLI loaded successfully (--help exited 0)"
+        else:
+            detail = "exited 0"
     elif result.timed_out:
         # Timeout: the process didn't exit on its own.
         if crashed:
