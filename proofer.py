@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -1207,18 +1207,35 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
             ]
         elif (repo_path / "pyproject.toml").exists():
             # No requirements.txt, but pyproject.toml exists (FastAPI,
-            # modern Python projects). Install the project + its declared
-            # dependencies into /tmp/pip_deps. This handles PEP 621
-            # [project.dependencies] and Poetry [tool.poetry.dependencies].
-            # We use --no-deps for the project itself (just install the
-            # declared deps, don't try to build the project package) and
-            # then install the project in editable mode for imports.
+            # modern Python projects). Extract the dependency list from
+            # pyproject.toml and install ONLY the dependencies to
+            # /tmp/pip_deps — NOT the package itself.
+            #
+            # Why not `pip install . -t /tmp/pip_deps`? Because that
+            # installs the package to /tmp/pip_deps, but the source
+            # checkout at /app/fastapi/ shadows it (cwd is on sys.path
+            # before PYTHONPATH). The source version's CLI then checks
+            # importlib.metadata, fails to find a "proper" install, and
+            # raises RuntimeError("please install fastapi"). By installing
+            # ONLY the deps and leaving the source as the package, we
+            # avoid the shadowing conflict entirely.
             install_cmd = [
                 "sh", "-c",
-                # Extract dependencies from pyproject.toml and install them.
-                # We use pip install . which reads pyproject.toml's
-                # [project.dependencies] and installs them to /tmp/pip_deps.
-                "pip install --no-cache-dir --prefer-binary "
+                # Try tomllib (3.11+) or tomli (3.10) to extract deps.
+                # Fall back to `pip install .` if parsing fails.
+                "python3 -c \""
+                "try:"
+                "  import tomllib as t;"
+                "except ImportError:"
+                "  import tomli as t;"
+                "d=t.loads(open('pyproject.toml','rb').read().decode());"
+                "deps=d.get('project',{}).get('dependencies',[]) or d.get('tool',{}).get('poetry',{}).get('dependencies',{});"
+                "deps=[k if isinstance(k,str) else k for k in (deps if isinstance(deps,list) else deps.keys())] if deps else [];"
+                "open('/tmp/deps.txt','w').write('\\n'.join(deps))"
+                "\" "
+                "&& pip install --no-cache-dir --prefer-binary "
+                "-t /tmp/pip_deps -r /tmp/deps.txt "
+                "|| pip install --no-cache-dir --prefer-binary "
                 "-t /tmp/pip_deps .",
             ]
         elif (repo_path / "setup.py").exists() or (repo_path / "setup.cfg").exists():
