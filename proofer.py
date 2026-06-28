@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -847,8 +847,9 @@ def _extract_pyproject_deps(pyproject_path: Path) -> list[str]:
 
     Handles:
       - PEP 621: [project.dependencies]
+      - PEP 621: [project.optional-dependencies] (installs 'standard' extra
+        so frameworks like FastAPI get their CLI tools)
       - Poetry: [tool.poetry.dependencies] (filters out 'python' key)
-      - Optional deps: [project.optional-dependencies]
 
     Returns a list of pip-installable requirement strings.
     """
@@ -893,6 +894,18 @@ def _extract_pyproject_deps(pyproject_path: Path) -> list[str]:
     project_deps = data.get("project", {}).get("dependencies", [])
     if isinstance(project_deps, list):
         deps.extend(project_deps)
+
+    # PEP 621: [project.optional-dependencies] — install the 'standard'
+    # extra so frameworks like FastAPI get their CLI (fastapi-cli, uvicorn).
+    # Without this, `python -m fastapi` fails with ImportError because
+    # fastapi_cli isn't in core deps.
+    optional_deps = data.get("project", {}).get("optional-dependencies", {})
+    if isinstance(optional_deps, dict):
+        for extra_name in ("standard", "all", "full", "cli"):
+            extra_deps = optional_deps.get(extra_name)
+            if isinstance(extra_deps, list):
+                deps.extend(extra_deps)
+                break  # Only install one extra (prefer 'standard')
 
     # Poetry: [tool.poetry.dependencies]
     poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
