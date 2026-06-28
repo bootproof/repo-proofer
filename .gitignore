@@ -46,3 +46,4 @@ Thumbs.db
 tests/fixtures/*/.git/
 dist/
 *.egg-info/
+fastapi-test2/
