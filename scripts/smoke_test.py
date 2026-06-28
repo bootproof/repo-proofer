@@ -1446,7 +1446,7 @@ def test_build_bwrap_args_execute_network_off():
 
 
 def test_build_bwrap_args_install_network_on():
-    """Install phase: NO --unshare-net, deps writable."""
+    """Install phase: NO --unshare-net, deps writable, repo writable."""
     repo = Path("/tmp/fake-repo")
     deps = Path("/tmp/fake-deps")
     stack = StackProfile(
@@ -1458,11 +1458,16 @@ def test_build_bwrap_args_install_network_on():
                              network=True, deps_writable=True)
     # Network must be ON for install
     assert "--unshare-net" not in args, "Install phase must NOT have --unshare-net"
+    # Repo writable (--bind, not --ro-bind) during install — pip needs to
+    # write egg-info/build artifacts to the source tree
+    repo_idx = args.index(str(repo))
+    assert args[repo_idx - 1] == "--bind", \
+        f"Repo must be --bind (writable) during install, got {args[repo_idx-1]}"
     # Deps writable (--bind, not --ro-bind)
     deps_idx = args.index(str(deps))
     assert args[deps_idx - 1] == "--bind", \
         f"Deps must be --bind (writable) during install, got {args[deps_idx-1]}"
-    print("[OK] _build_bwrap_args: install has NO --unshare-net + writable deps")
+    print("[OK] _build_bwrap_args: install has NO --unshare-net + writable repo + writable deps")
 
 
 def test_build_bwrap_args_home_root_isolated():

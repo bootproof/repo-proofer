@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -1715,10 +1715,19 @@ def _build_bwrap_args(
         # Cleanup + isolation
         "--die-with-parent",
         "--new-session",
-        # Repo mounted read-only at /app
-        "--ro-bind", str(repo_path), "/app",
-        "--chdir", "/app",
     ]
+
+    # Repo mount: read-write during install (pip needs to write egg-info),
+    # read-only during execute (the security moat).
+    if not network:
+        # Execute phase: read-only (the moat)
+        args += ["--ro-bind", str(repo_path), "/app"]
+    else:
+        # Install phase: read-write (pip/setuptools need to write build
+        # artifacts to the source tree). Still isolated: --cap-drop ALL,
+        # empty /home, empty /root, no SSH keys accessible.
+        args += ["--bind", str(repo_path), "/app"]
+    args += ["--chdir", "/app"]
 
     # Network isolation — ONLY during execute. Install needs network.
     if not network:
@@ -1880,7 +1889,10 @@ def install_deps(
 
     Security note: install is intentionally more permissive than exec —
     it needs network to fetch packages and write access to the deps
-    cache directory. The repo is still mounted read-only.
+    cache directory. The repo is mounted read-write during install
+    because pip/setuptools/pdm need to write build artifacts (egg-info,
+    .egg-info, build/) to the source tree. The exec phase still mounts
+    the repo :ro. Network is ON during install, OFF during exec.
     """
     if not stack.install_cmd:
         return None
@@ -1891,7 +1903,11 @@ def install_deps(
         "--memory", "512m",
         "--cpus", "0.5",
         "--tmpfs", "/tmp",
-        "-v", f"{repo_path}:/app:ro",
+        # Repo mounted :rw during install — pip needs to write egg-info
+        # and build artifacts to the source tree. This is safe: install
+        # runs with --cap-drop ALL and network ON (needed for pip fetch).
+        # The exec phase mounts the same repo :ro.
+        "-v", f"{repo_path}:/app:rw",
         "-w", "/app",
     ]
     if stack.deps_mount:
