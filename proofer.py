@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -451,9 +451,14 @@ class BehaviorReport:
 # Regex patterns for claim extraction. Each is (pattern, claim_type).
 # The claim_type determines how we match against runtime evidence.
 CLAIM_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # Port claims: "listening on port 3000", "runs on :8080", "port 5000"
+    # Port claims: "listening on port 3000", "runs on :8080", "port 5000",
+    # "http://localhost:8000", "http://127.0.0.1:3000"
     (re.compile(
         r'(?:listening|runs?|starts?|serves?|binds?)\s+(?:on\s+)?(?:port\s+)?[:]?(\d{4,5})',
+        re.IGNORECASE), "port"),
+    # URL-based port: http://localhost:8000, http://127.0.0.1:3000
+    (re.compile(
+        r'https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{4,5})',
         re.IGNORECASE), "port"),
 
     # Database/service claims: "connects to PostgreSQL", "requires Redis"
@@ -468,11 +473,14 @@ CLAIM_PATTERNS: list[tuple[re.Pattern, str]] = [
         r'(openai|anthropic|stripe|github|twitter|slack|aws)\s*(?:api)?',
         re.IGNORECASE), "api"),
 
-    # Install commands from README code blocks
-    (re.compile(r'pip\s+install\s+(?:-r\s+)?requirements\.txt'), "install_python"),
+    # Install commands from README code blocks — broadened to catch
+    # real-world patterns like "pip install fastapi", "npm install",
+    # "pip install -r requirements.txt", etc.
+    (re.compile(r'pip\s+install\s+(?:-r\s+)?(?:requirements\.txt|\S+)'), "install_python"),
     (re.compile(r'npm\s+install'), "install_node"),
     (re.compile(r'cargo\s+(?:build|install)'), "install_rust"),
     (re.compile(r'go\s+mod\s+(?:download|vendor)'), "install_go"),
+    (re.compile(r'bundle\s+install'), "install_ruby"),
 
     # Run commands from README code blocks
     (re.compile(r'python\s+(main|app|server|run|manage)\.py'), "run_python"),
@@ -487,10 +495,10 @@ CLAIM_PATTERNS: list[tuple[re.Pattern, str]] = [
         r'\.?(csv|json|xml|yaml|yml|toml|excel|xlsx)\s+files?',
         re.IGNORECASE), "file_type"),
 
-    # Framework: "built with Flask", "uses Express"
+    # Framework: "built with Flask", "uses Express", "FastAPI framework"
     (re.compile(
-        r'(?:built\s+with|uses?|powered\s+by|written\s+in)\s+'
-        r'(flask|django|fastapi|express|nextjs|next\.js|react|vue|angular|spring|rails|starlette)',
+        r'(?:built\s+with|uses?|powered\s+by|written\s+in|based\s+on|is\s+a)\s+'
+        r'(flask|django|fastapi|starlette|express|nextjs|next\.js|react|vue|angular|spring|rails|starlette|uvicorn|gunicorn|pydantic)',
         re.IGNORECASE), "framework"),
 ]
 
@@ -726,6 +734,9 @@ def _match_single_claim(
             return ClaimMatch(claim, "VERIFIED",
                               f"Install used: {install_str}")
         if claim.claim_type == "install_go" and "go mod" in install_str:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Install used: {install_str}")
+        if claim.claim_type == "install_ruby" and "bundle" in install_str:
             return ClaimMatch(claim, "VERIFIED",
                               f"Install used: {install_str}")
         return ClaimMatch(claim, "UNVERIFIED",
