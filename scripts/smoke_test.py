@@ -806,7 +806,81 @@ def test_parse_sensitive_ssh_access():
     assert "/app/.env" in r.sensitive_access
     assert "/app/.env" in r.files_read
     assert "/root/.ssh/id_rsa" in r.files_read
-    print("[OK] parse_strace_output: sensitive paths (ssh, aws, .env) detected")
+    # SSH keys, AWS creds, .env are HIGH-severity — must NOT be in medium list
+    assert "/root/.ssh/id_rsa" not in r.medium_sensitive_access
+    assert "/home/user/.aws/credentials" not in r.medium_sensitive_access
+    assert "/app/.env" not in r.medium_sensitive_access
+    print("[OK] parse_strace_output: HIGH-severity paths (ssh, aws, .env) in sensitive_access")
+
+
+def test_parse_npmrc_is_medium_not_high():
+    """Regression test: .npmrc must be MEDIUM, not HIGH.
+
+    npm reads .npmrc for registry/auth/config during normal operation.
+    Flagging it as HIGH ("primary indicator of malicious intent") was a
+    false alarm that destroyed credibility on legitimate repos like
+    Supabase. .npmrc now goes to medium_sensitive_access (informational),
+    NOT sensitive_access (hard fail).
+    """
+    d = Path(tempfile.mkdtemp(prefix="trace-npmrc-"))
+    _write_trace(d, "trace.100", [
+        'execve("/usr/local/bin/npm", ["npm", "start"], ...) = 0',
+        'openat(AT_FDCWD, "/app/.npmrc", O_RDONLY) = 3',
+        'openat(AT_FDCWD, "/root/.npmrc", O_RDONLY) = -1 ENOENT',
+        '+++ exited with 1 +++',
+    ])
+    r = parse_strace_output(d)
+    # .npmrc must be in MEDIUM, NOT HIGH
+    assert "/app/.npmrc" in r.medium_sensitive_access, \
+        f".npmrc must be MEDIUM-severity, got {r.medium_sensitive_access}"
+    assert "/root/.npmrc" in r.medium_sensitive_access
+    assert "/app/.npmrc" not in r.sensitive_access, \
+        f".npmrc must NOT be HIGH-severity (false alarm), got {r.sensitive_access}"
+    assert "/root/.npmrc" not in r.sensitive_access
+    print("[OK] parse_strace_output: .npmrc is MEDIUM (not HIGH) — no false alarm")
+
+
+def test_parse_pypirc_netrc_are_medium():
+    """Other package-manager config files (.pypirc, .netrc) are also MEDIUM."""
+    d = Path(tempfile.mkdtemp(prefix="trace-pm-config-"))
+    _write_trace(d, "trace.200", [
+        'execve("/usr/local/bin/pip", ["pip", "install"], ...) = 0',
+        'openat(AT_FDCWD, "/root/.pypirc", O_RDONLY) = -1 ENOENT',
+        'openat(AT_FDCWD, "/root/.netrc", O_RDONLY) = -1 ENOENT',
+        '+++ exited with 0 +++',
+    ])
+    r = parse_strace_output(d)
+    assert "/root/.pypirc" in r.medium_sensitive_access
+    assert "/root/.netrc" in r.medium_sensitive_access
+    assert "/root/.pypirc" not in r.sensitive_access
+    assert "/root/.netrc" not in r.sensitive_access
+    print("[OK] parse_strace_output: .pypirc, .netrc are MEDIUM (package-manager config)")
+
+
+def test_parse_mixed_high_and_medium():
+    """A repo that reads both SSH keys (HIGH) and .npmrc (MEDIUM) must
+    classify them into separate tiers. HIGH triggers hard fail; MEDIUM
+    is informational only."""
+    d = Path(tempfile.mkdtemp(prefix="trace-mixed-"))
+    _write_trace(d, "trace.300", [
+        'execve("/usr/local/bin/node", ["node", "index.js"], ...) = 0',
+        'openat(AT_FDCWD, "/app/.npmrc", O_RDONLY) = 3',       # MEDIUM
+        'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT',  # HIGH
+        'openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = 4',        # HIGH
+        '+++ exited with 0 +++',
+    ])
+    r = parse_strace_output(d)
+    # HIGH tier: SSH key + passwd
+    assert "/root/.ssh/id_rsa" in r.sensitive_access
+    assert "/etc/passwd" in r.sensitive_access
+    assert len(r.sensitive_access) == 2
+    # MEDIUM tier: .npmrc only
+    assert "/app/.npmrc" in r.medium_sensitive_access
+    assert len(r.medium_sensitive_access) == 1
+    # No cross-contamination
+    assert "/app/.npmrc" not in r.sensitive_access
+    assert "/root/.ssh/id_rsa" not in r.medium_sensitive_access
+    print("[OK] parse_strace_output: HIGH and MEDIUM tiers separated correctly")
 
 
 def test_parse_runtime_noise_filtered():
@@ -1233,6 +1307,9 @@ def run_all():
     test_parse_clean_app()
     test_parse_network_attempt()
     test_parse_sensitive_ssh_access()
+    test_parse_npmrc_is_medium_not_high()
+    test_parse_pypirc_netrc_are_medium()
+    test_parse_mixed_high_and_medium()
     test_parse_runtime_noise_filtered()
     test_parse_dedup_across_forks()
     test_parse_multiple_distinct_writes()

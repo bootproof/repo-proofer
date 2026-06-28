@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -199,11 +199,22 @@ RUNTIME_NOISE_PREFIXES = (
     "/dev/random",
 )
 
-# Sensitive paths that, if accessed, indicate a likely exfil attempt.
-# These are NEVER filtered out — they get their own dedicated section
-# in the report so the enterprise CISO sees them immediately. This is
-# the "read ~/.ssh/id_rsa" detection the enterprise story hinges on.
-SENSITIVE_PATH_PATTERNS = [
+# Sensitive paths are classified into two severity tiers.
+#
+# HIGH: paths that indicate credential/key theft if accessed. These are
+#   the true exfil signals — SSH keys, .env files, /etc/passwd, AWS
+#   credentials. HIGH-tier access ALWAYS triggers a hard fail (exit 1)
+#   and the "primary indicator of malicious intent" wording.
+#
+# MEDIUM: package-manager config files (.npmrc, .pypirc, .netrc, etc).
+#   These are routinely read during normal install/run — npm checks
+#   .npmrc for registry/auth config, pip checks .pypirc. Flagging them
+#   as "primary indicator of malicious intent" (the old behavior) was a
+#   false alarm that destroyed credibility on legitimate repos like
+#   Supabase. MEDIUM-tier access is reported as an informational note,
+#   NOT a hard fail. The user sees it and can review, but the verdict
+#   isn't auto-failed.
+SENSITIVE_PATH_PATTERNS_HIGH = [
     re.compile(r'^/root/\.ssh/'),
     re.compile(r'^/home/[^/]+/\.ssh/'),
     re.compile(r'^/etc/passwd$'),
@@ -211,14 +222,23 @@ SENSITIVE_PATH_PATTERNS = [
     re.compile(r'^/etc/sudoers'),
     re.compile(r'\.aws/credentials'),
     re.compile(r'\.gnupg/'),
-    re.compile(r'\.netrc$'),
-    re.compile(r'\.npmrc$'),
     re.compile(r'\.docker/config\.json'),
     re.compile(r'\.kube/config'),
     re.compile(r'\.git-credentials'),
     re.compile(r'\.env$'),
     re.compile(r'\.env\.'),
 ]
+
+SENSITIVE_PATH_PATTERNS_MEDIUM = [
+    re.compile(r'\.npmrc$'),
+    re.compile(r'\.pypirc$'),
+    re.compile(r'\.netrc$'),
+    re.compile(r'pip\.conf$'),
+    re.compile(r'cargo/credentials'),
+]
+
+# Backward-compat alias (deprecated — use the tiered lists above)
+SENSITIVE_PATH_PATTERNS = SENSITIVE_PATH_PATTERNS_HIGH + SENSITIVE_PATH_PATTERNS_MEDIUM
 
 # ----------------------------------------------------------------------
 # Readiness signals — used to distinguish a healthy long-running
@@ -334,7 +354,13 @@ class BehaviorReport:
     files_written: list[str] = field(default_factory=list)
     processes_spawned: list[str] = field(default_factory=list)
     network_attempts: list[str] = field(default_factory=list)
+    # HIGH-severity sensitive access: SSH keys, .env, /etc/passwd, AWS
+    # creds. Always triggers a hard fail (exit 1) + red wording.
     sensitive_access: list[str] = field(default_factory=list)
+    # MEDIUM-severity: package-manager config (.npmrc, .pypirc, .netrc).
+    # Reported as an informational note, NOT a hard fail. npm reading
+    # .npmrc is normal behavior, not malicious intent.
+    medium_sensitive_access: list[str] = field(default_factory=list)
     strace_enabled: bool = False
 
     @property
@@ -342,7 +368,7 @@ class BehaviorReport:
         return any([
             self.files_read, self.files_written,
             self.processes_spawned, self.network_attempts,
-            self.sensitive_access,
+            self.sensitive_access, self.medium_sensitive_access,
         ])
 
 
@@ -1494,7 +1520,8 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
     seen_writes: set[str] = set()
     seen_procs: set[str] = set()
     seen_net: set[str] = set()
-    seen_sensitive: set[str] = set()
+    seen_sensitive_high: set[str] = set()
+    seen_sensitive_medium: set[str] = set()
 
     trace_files = sorted(trace_dir.glob("trace*"))
     if not trace_files:
@@ -1511,13 +1538,22 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
             m = STRACE_OPEN_RE.match(line)
             if m:
                 path = m.group(1)
-                is_sensitive = any(
-                    p.search(path) for p in SENSITIVE_PATH_PATTERNS
+                # Classify sensitive paths into HIGH and MEDIUM tiers.
+                # HIGH = credential/key theft (SSH, .env, /etc/passwd, AWS).
+                # MEDIUM = package-manager config (.npmrc, .pypirc, .netrc)
+                #   — routinely read by npm/pip during normal operation.
+                is_high = any(
+                    p.search(path) for p in SENSITIVE_PATH_PATTERNS_HIGH
+                )
+                is_medium = any(
+                    p.search(path) for p in SENSITIVE_PATH_PATTERNS_MEDIUM
                 )
                 # Sensitive paths are ALWAYS recorded, even if they
                 # also match a runtime-noise prefix (paranoid by design).
-                if is_sensitive and path not in seen_sensitive:
-                    seen_sensitive.add(path)
+                if is_high and path not in seen_sensitive_high:
+                    seen_sensitive_high.add(path)
+                elif is_medium and path not in seen_sensitive_medium:
+                    seen_sensitive_medium.add(path)
 
                 # Filter runtime noise from read/write tallies.
                 if path.startswith(RUNTIME_NOISE_PREFIXES):
@@ -1582,11 +1618,12 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
                     seen_net.add(entry)
                 continue
 
-    report.files_read = sorted(seen_reads)
-    report.files_written = sorted(seen_writes)
-    report.processes_spawned = sorted(seen_procs)
-    report.network_attempts = sorted(seen_net)
-    report.sensitive_access = sorted(seen_sensitive)
+    report.files_read = sorted(set(seen_reads))
+    report.files_written = sorted(set(seen_writes))
+    report.processes_spawned = sorted(set(seen_procs))
+    report.network_attempts = sorted(set(seen_net))
+    report.sensitive_access = sorted(set(seen_sensitive_high))
+    report.medium_sensitive_access = sorted(set(seen_sensitive_medium))
     return report
 
 
@@ -1683,14 +1720,22 @@ def print_behavior_report(report: BehaviorReport) -> None:
     table.add_row("Files Written", str(len(report.files_written)))
     table.add_row("Processes Spawned", str(len(report.processes_spawned)))
     table.add_row("Network Calls Attempted", str(len(report.network_attempts)))
+    # HIGH-severity: SSH keys, .env, /etc/passwd, AWS creds — the exfil signal
     if report.sensitive_access:
         table.add_row(
-            "Sensitive File Access",
+            "Sensitive File Access (HIGH)",
             f"[bold red]{len(report.sensitive_access)}[/bold red] "
             f"(see below)",
         )
     else:
-        table.add_row("Sensitive File Access", "[green]0[/green]")
+        table.add_row("Sensitive File Access (HIGH)", "[green]0[/green]")
+    # MEDIUM-severity: .npmrc, .pypirc, .netrc — normal package-manager config
+    if report.medium_sensitive_access:
+        table.add_row(
+            "Config File Access (MEDIUM)",
+            f"[yellow]{len(report.medium_sensitive_access)}[/yellow] "
+            f"(informational)",
+        )
 
     console.print(Panel(
         table,
@@ -1724,14 +1769,31 @@ def print_behavior_report(report: BehaviorReport) -> None:
             border_style="red",
         ))
 
+    # HIGH-severity panel — the exfil signal. Red, bold, alarming.
     if report.sensitive_access:
         console.print(Panel(
             "\n".join(f"- {p}" for p in report.sensitive_access),
             title=(
-                f"[bold red]Sensitive File Access "
+                f"[bold red]Sensitive File Access — HIGH "
                 f"({len(report.sensitive_access)})[/bold red]"
             ),
             border_style="red",
+        ))
+
+    # MEDIUM-severity panel — informational, not alarming. Yellow, dim.
+    # .npmrc/.pypirc reads are normal package-manager behavior; flagging
+    # them as "primary indicator of malicious intent" was a false alarm
+    # that destroyed credibility on legitimate repos like Supabase.
+    if report.medium_sensitive_access:
+        console.print(Panel(
+            "\n".join(f"- {p}" for p in report.medium_sensitive_access),
+            title=(
+                f"[yellow]Package-Manager Config Access — MEDIUM "
+                f"({len(report.medium_sensitive_access)})[/yellow]\n"
+                "[dim]Informational only — normal npm/pip behavior. "
+                "Review if unexpected.[/dim]"
+            ),
+            border_style="yellow",
         ))
 
 
@@ -1977,31 +2039,34 @@ def main(
         print_behavior_report(behavior_report)
 
         # ---- Step 6b: Sensitive-access escalation ------------------
-        # Sensitive file access is ALWAYS a hard fail, regardless of
-        # whether the app crashed or exited cleanly. The previous logic
-        # only escalated when boots=True, which meant a crashing repo
-        # that read ~/.ssh/id_rsa would never trigger the escalation —
-        # its sensitive access was buried under a crash verdict.
-        #
-        # Now: if strace caught ANY sensitive-path access, the exit
-        # code is always 1, and the verdict is always NO. If the app
-        # exited cleanly, we explicitly escalate. If it already crashed,
-        # we foreground the sensitive access as the primary indicator.
+        # Only HIGH-severity access (SSH keys, .env, /etc/passwd, AWS creds)
+        # triggers a hard fail. MEDIUM-severity (.npmrc, .pypirc, .netrc) is
+        # normal package-manager behavior — reported as informational, NOT
+        # a hard fail. Flagging .npmrc reads as "primary indicator of
+        # malicious intent" was a false alarm that destroyed credibility on
+        # legitimate repos like Supabase.
         if behavior_report.sensitive_access:
             if verdict.boots:
-                # Clean exit but touched secrets — escalate.
+                # Clean exit but touched HIGH-severity secrets — escalate.
                 console.print(
                     "[bold red][!] Escalating verdict to BOOTS: NO — "
-                    "sensitive file access detected despite clean exit.[/bold red]"
+                    "high-risk sensitive file access detected despite clean exit.[/bold red]"
                 )
             else:
-                # Already crashed, but sensitive access is the headline.
+                # Already crashed, but HIGH-severity access is the headline.
                 console.print(
-                    "[bold red][!] Sensitive file access detected — "
+                    "[bold red][!] High-risk sensitive file access detected — "
                     "primary indicator of malicious intent. "
                     f"Paths: {', '.join(behavior_report.sensitive_access)}[/bold red]"
                 )
             raise typer.Exit(code=1)
+
+        # MEDIUM-severity: informational note, NOT a hard fail.
+        if behavior_report.medium_sensitive_access:
+            console.print(
+                f"[yellow][i] Package-manager config access observed: "
+                f"{', '.join(behavior_report.medium_sensitive_access)}[/yellow]"
+            )
 
         # A library (no runnable entrypoint) is not slop — exit 0 so CI
         # doesn't block on library repos. The verdict display is yellow,
