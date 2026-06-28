@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -202,23 +202,23 @@ RUNTIME_NOISE_PREFIXES = (
 # Sensitive paths are classified into two severity tiers.
 #
 # HIGH: paths that indicate credential/key theft if accessed. These are
-#   the true exfil signals — SSH keys, .env files, /etc/passwd, AWS
-#   credentials. HIGH-tier access ALWAYS triggers a hard fail (exit 1)
-#   and the "primary indicator of malicious intent" wording.
+#   the true exfil signals — SSH keys, .env files, AWS credentials,
+#   /etc/shadow (password hashes), Docker/Kube config. Almost nothing
+#   benign touches these. HIGH-tier access triggers the "malicious
+#   intent" wording ONLY when correlated with a network attempt (the
+#   smoking gun for exfiltration). HIGH read + 0 network = suspicious
+#   but not confirmed exfil (softer wording).
 #
-# MEDIUM: package-manager config files (.npmrc, .pypirc, .netrc, etc).
-#   These are routinely read during normal install/run — npm checks
-#   .npmrc for registry/auth config, pip checks .pypirc. Flagging them
-#   as "primary indicator of malicious intent" (the old behavior) was a
-#   false alarm that destroyed credibility on legitimate repos like
-#   Supabase. MEDIUM-tier access is reported as an informational note,
-#   NOT a hard fail. The user sees it and can review, but the verdict
-#   isn't auto-failed.
+# MEDIUM: paths routinely read by normal operation — package-manager
+#   config (.npmrc, .pypirc, .netrc) AND /etc/passwd (read by libc on
+#   every getpwnam() call — basically every program that resolves a
+#   username or home directory touches it). Flagging these as "malicious
+#   intent" was a false alarm that destroyed credibility on legitimate
+#   repos like Supabase. MEDIUM-tier access is informational, NOT a fail.
 SENSITIVE_PATH_PATTERNS_HIGH = [
     re.compile(r'^/root/\.ssh/'),
     re.compile(r'^/home/[^/]+/\.ssh/'),
-    re.compile(r'^/etc/passwd$'),
-    re.compile(r'^/etc/shadow$'),
+    re.compile(r'^/etc/shadow$'),          # password hashes — almost never read benignly
     re.compile(r'^/etc/sudoers'),
     re.compile(r'\.aws/credentials'),
     re.compile(r'\.gnupg/'),
@@ -235,6 +235,9 @@ SENSITIVE_PATH_PATTERNS_MEDIUM = [
     re.compile(r'\.netrc$'),
     re.compile(r'pip\.conf$'),
     re.compile(r'cargo/credentials'),
+    re.compile(r'^/etc/passwd$'),          # libc reads this on every getpwnam() — low signal
+    re.compile(r'^/etc/nsswitch\.conf$'),  # libc name service config — routine
+    re.compile(r'^/etc/hosts$'),           # libc resolver — routine
 ]
 
 # Backward-compat alias (deprecated — use the tiered lists above)
@@ -315,9 +318,12 @@ class ExecutionResult:
     timed_out: bool = False
     # True when the stack had NO runnable entrypoint candidates at all
     # (e.g. a pyproject.toml-only library like `click` or `markupsafe`).
-    # This is distinct from a crash — it means there was nothing to run.
-    # Used by analyze_result to produce a neutral verdict instead of red.
     no_candidates: bool = False
+    # True when the repo is a monorepo (npm workspaces) with no root
+    # entrypoint. Distinguished from a crash: "npm error Missing script:
+    # start" on a workspace repo is NOT a crash, it's a missing root
+    # entrypoint. Produces a yellow verdict, not red.
+    monorepo_no_root_entry: bool = False
 
 
 @dataclass
@@ -339,6 +345,10 @@ class Verdict:
     # nothing to run. Without this, `click` and `markupsafe` would show
     # the same red as an SSH-key-stealing malware repo, which erodes trust.
     no_entrypoint: bool = False
+    # True when the repo is a monorepo (npm workspaces) with no root
+    # entrypoint. Same yellow treatment as no_entrypoint — a monorepo
+    # isn't slop, it just has no root start script.
+    monorepo: bool = False
 
 
 @dataclass
@@ -352,21 +362,26 @@ class BehaviorReport:
     """
     files_read: list[str] = field(default_factory=list)
     files_written: list[str] = field(default_factory=list)
+    # Write attempts that were BLOCKED by the read-only filesystem (open
+    # returned -1 EROFS/EACCES). Reported honestly as "blocked" not
+    # "written" — the Supabase bug counted npm's rejected log write as a
+    # successful write, which is dishonest.
+    writes_blocked: list[str] = field(default_factory=list)
     processes_spawned: list[str] = field(default_factory=list)
     network_attempts: list[str] = field(default_factory=list)
-    # HIGH-severity sensitive access: SSH keys, .env, /etc/passwd, AWS
-    # creds. Always triggers a hard fail (exit 1) + red wording.
+    # HIGH-severity sensitive access: SSH keys, .env, /etc/shadow, AWS
+    # creds. Triggers "malicious intent" ONLY when correlated with a
+    # network attempt (the exfil smoking gun).
     sensitive_access: list[str] = field(default_factory=list)
-    # MEDIUM-severity: package-manager config (.npmrc, .pypirc, .netrc).
-    # Reported as an informational note, NOT a hard fail. npm reading
-    # .npmrc is normal behavior, not malicious intent.
+    # MEDIUM-severity: package-manager config (.npmrc, .pypirc, .netrc)
+    # AND /etc/passwd (read by libc on every getpwnam). Informational.
     medium_sensitive_access: list[str] = field(default_factory=list)
     strace_enabled: bool = False
 
     @property
     def has_data(self) -> bool:
         return any([
-            self.files_read, self.files_written,
+            self.files_read, self.files_written, self.writes_blocked,
             self.processes_spawned, self.network_attempts,
             self.sensitive_access, self.medium_sensitive_access,
         ])
@@ -375,6 +390,28 @@ class BehaviorReport:
 # ----------------------------------------------------------------------
 # Stack detection — deterministic, file-existence based
 # ----------------------------------------------------------------------
+
+def _detect_node_workspaces(repo_path: Path) -> Optional[list[str]]:
+    """Detect npm/pnpm workspaces in package.json.
+
+    Returns the list of workspace glob patterns if present, or None.
+    Used to distinguish "monorepo with no root start script" (yellow,
+    not slop) from "app that crashed" (red). Supabase, turborepo, etc.
+    declare workspaces but have no root entrypoint — reporting them as
+    a crash was a false alarm.
+    """
+    import json
+    try:
+        pkg = json.loads((repo_path / "package.json").read_text())
+    except (OSError, ValueError):
+        return None
+    workspaces = pkg.get("workspaces")
+    if isinstance(workspaces, list):
+        return workspaces
+    if isinstance(workspaces, dict) and "packages" in workspaces:
+        return workspaces["packages"]
+    return None
+
 
 def _detect_node_entrypoints(repo_path: Path) -> list[list[str]]:
     """Read package.json to pick entrypoints deterministically.
@@ -1196,6 +1233,13 @@ def native_execute_entrypoint(
         return result
 
     if last_result is not None:
+        # Monorepo detection (same logic as Docker execute_entrypoint).
+        if stack.name == "Node.js":
+            workspaces = _detect_node_workspaces(repo_path)
+            if workspaces:
+                combined = (last_result.stdout + "\n" + last_result.stderr).lower()
+                if "missing script" in combined or "no such file" in combined:
+                    last_result.monorepo_no_root_entry = True
         return last_result
 
     return ExecutionResult(
@@ -1357,6 +1401,17 @@ def execute_entrypoint(
         return result
 
     if last_result is not None:
+        # Check if this is a monorepo (npm workspaces) with no root
+        # entrypoint. "npm error Missing script: start" on a workspace
+        # repo is NOT a crash — it's a missing root entrypoint. Detect
+        # this and flag it so analyze_result produces a yellow verdict
+        # instead of red. (The Supabase false-alarm fix.)
+        if stack.name == "Node.js":
+            workspaces = _detect_node_workspaces(repo_path)
+            if workspaces:
+                combined = (last_result.stdout + "\n" + last_result.stderr).lower()
+                if "missing script" in combined or "no such file" in combined:
+                    last_result.monorepo_no_root_entry = True
         return last_result
 
     return ExecutionResult(
@@ -1419,6 +1474,24 @@ def analyze_result(result: ExecutionResult) -> Verdict:
             warnings=[],
             detail="no runnable entrypoint (looks like a library)",
             no_entrypoint=True,
+        )
+
+    # ---- Monorepo case ----
+    # A workspace repo (npm workspaces) with no root start script is NOT
+    # a crash. "npm error Missing script: start" on a monorepo is the
+    # expected behavior — the entrypoints live in sub-packages. Reporting
+    # this as "exited 1 (crash)" was a false alarm on repos like Supabase.
+    if result.monorepo_no_root_entry:
+        return Verdict(
+            boots=False,
+            network_egress_blocked=True,
+            filesystem_read_only=True,
+            stdout_preview=result.stdout[:MAX_STDOUT_CHARS],
+            stderr_preview=result.stderr[:MAX_STDERR_CHARS],
+            warnings=[],
+            detail="monorepo: no root entrypoint (workspaces detected — try a sub-package)",
+            no_entrypoint=True,
+            monorepo=True,
         )
 
     warnings: list[str] = []
@@ -1518,6 +1591,7 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
 
     seen_reads: set[str] = set()
     seen_writes: set[str] = set()
+    seen_writes_blocked: set[str] = set()
     seen_procs: set[str] = set()
     seen_net: set[str] = set()
     seen_sensitive_high: set[str] = set()
@@ -1569,9 +1643,23 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
                     or bool(STRACE_WRITE_FLAGS_RE.search(line))
                 )
 
+                # Check the syscall return value. A negative return (e.g.
+                # -1 EROFS, -1 EACCES) means the open was REJECTED —
+                # typically by the read-only filesystem. Counting these
+                # as successful writes is dishonest (the Supabase bug:
+                # npm's log write was blocked but the report said
+                # "Files Written 1"). Split into successful writes vs
+                # blocked write attempts.
+                retval = int(m.group(2))
+                write_blocked = (retval < 0)
+
                 if is_write:
-                    if path not in seen_writes:
-                        seen_writes.add(path)
+                    if write_blocked:
+                        if path not in seen_writes_blocked:
+                            seen_writes_blocked.add(path)
+                    else:
+                        if path not in seen_writes:
+                            seen_writes.add(path)
                 else:
                     if path not in seen_reads:
                         seen_reads.add(path)
@@ -1620,6 +1708,7 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
 
     report.files_read = sorted(set(seen_reads))
     report.files_written = sorted(set(seen_writes))
+    report.writes_blocked = sorted(set(seen_writes_blocked))
     report.processes_spawned = sorted(set(seen_procs))
     report.network_attempts = sorted(set(seen_net))
     report.sensitive_access = sorted(set(seen_sensitive_high))
@@ -1718,9 +1807,15 @@ def print_behavior_report(report: BehaviorReport) -> None:
     table.add_column()
     table.add_row("Files Read", str(len(report.files_read)))
     table.add_row("Files Written", str(len(report.files_written)))
+    if report.writes_blocked:
+        table.add_row(
+            "Write Attempts Blocked",
+            f"[yellow]{len(report.writes_blocked)}[/yellow] "
+            f"(by read-only FS)",
+        )
     table.add_row("Processes Spawned", str(len(report.processes_spawned)))
     table.add_row("Network Calls Attempted", str(len(report.network_attempts)))
-    # HIGH-severity: SSH keys, .env, /etc/passwd, AWS creds — the exfil signal
+    # HIGH-severity: SSH keys, .env, /etc/shadow, AWS creds — the exfil signal
     if report.sensitive_access:
         table.add_row(
             "Sensitive File Access (HIGH)",
@@ -1729,7 +1824,7 @@ def print_behavior_report(report: BehaviorReport) -> None:
         )
     else:
         table.add_row("Sensitive File Access (HIGH)", "[green]0[/green]")
-    # MEDIUM-severity: .npmrc, .pypirc, .netrc — normal package-manager config
+    # MEDIUM-severity: .npmrc, .pypirc, .netrc, /etc/passwd — routine reads
     if report.medium_sensitive_access:
         table.add_row(
             "Config File Access (MEDIUM)",
@@ -1749,6 +1844,20 @@ def print_behavior_report(report: BehaviorReport) -> None:
         console.print(Panel(
             "\n".join(f"- {p}" for p in report.files_written),
             title=f"[yellow]Files Written ({len(report.files_written)})[/yellow]",
+            border_style="yellow",
+        ))
+
+    # Blocked writes — the read-only FS rejected these. Honest reporting:
+    # don't count rejected writes as successful (the Supabase bug).
+    if report.writes_blocked:
+        console.print(Panel(
+            "\n".join(f"- {p}" for p in report.writes_blocked),
+            title=(
+                f"[yellow]Write Attempts Blocked "
+                f"({len(report.writes_blocked)})[/yellow]\n"
+                "[dim]Rejected by read-only filesystem — nothing was "
+                "actually written.[/dim]"
+            ),
             border_style="yellow",
         ))
 
@@ -2038,28 +2147,44 @@ def main(
         print_verdict(verdict, repo_url, stack.name, install_result)
         print_behavior_report(behavior_report)
 
-        # ---- Step 6b: Sensitive-access escalation ------------------
-        # Only HIGH-severity access (SSH keys, .env, /etc/passwd, AWS creds)
-        # triggers a hard fail. MEDIUM-severity (.npmrc, .pypirc, .netrc) is
-        # normal package-manager behavior — reported as informational, NOT
-        # a hard fail. Flagging .npmrc reads as "primary indicator of
-        # malicious intent" was a false alarm that destroyed credibility on
-        # legitimate repos like Supabase.
+        # ---- Step 6b: Sensitive-access escalation (correlation-gated) -----
+        # The smoking gun for exfiltration is "read a secret AND THEN
+        # reached for the network." A HIGH-severity read with 0 network
+        # attempts is suspicious but not confirmed exfil — the secret
+        # may have been read by a dependency's init code, a health check,
+        # or a misconfigured loader. We reserve "primary indicator of
+        # malicious intent" for the correlated case.
+        #
+        # MEDIUM-severity (.npmrc, .pypirc, /etc/passwd) is never a hard
+        # fail — these are routinely read by npm/pip/libc.
         if behavior_report.sensitive_access:
-            if verdict.boots:
-                # Clean exit but touched HIGH-severity secrets — escalate.
+            has_network = bool(behavior_report.network_attempts)
+            if has_network:
+                # HIGH secret read + network attempt = exfiltration signal.
+                # This is the "primary indicator of malicious intent" —
+                # the line that earns the red wording.
                 console.print(
-                    "[bold red][!] Escalating verdict to BOOTS: NO — "
-                    "high-risk sensitive file access detected despite clean exit.[/bold red]"
+                    "[bold red][!] EXFILTRATION DETECTED — high-risk "
+                    "sensitive file access correlated with network "
+                    f"attempt(s). Secret paths: "
+                    f"{', '.join(behavior_report.sensitive_access)}. "
+                    f"Network: {', '.join(behavior_report.network_attempts)}. "
+                    "Primary indicator of malicious intent.[/bold red]"
                 )
+                raise typer.Exit(code=1)
             else:
-                # Already crashed, but HIGH-severity access is the headline.
+                # HIGH secret read + 0 network = suspicious but no exfil
+                # attempted. Warn loudly but don't accuse. The read is
+                # real and worth investigating, but "malicious intent"
+                # is overclaiming when nothing tried to leave the box.
                 console.print(
-                    "[bold red][!] High-risk sensitive file access detected — "
-                    "primary indicator of malicious intent. "
-                    f"Paths: {', '.join(behavior_report.sensitive_access)}[/bold red]"
+                    f"[yellow][!] Sensitive file access detected (no "
+                    f"exfiltration attempted — network blocked, 0 calls). "
+                    f"Paths: {', '.join(behavior_report.sensitive_access)}. "
+                    f"Review whether the app should be reading these.[/yellow]"
                 )
-            raise typer.Exit(code=1)
+                # Don't hard-fail — the app may legitimately read .env for
+                # config. The warning is visible; the user decides.
 
         # MEDIUM-severity: informational note, NOT a hard fail.
         if behavior_report.medium_sensitive_access:

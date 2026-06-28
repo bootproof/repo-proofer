@@ -466,6 +466,49 @@ def test_detect_unknown():
     print("[OK] detect_stack: unknown -> None")
 
 
+def test_detect_node_workspaces():
+    """Detect npm workspaces (monorepo) in package.json."""
+    from proofer import _detect_node_workspaces
+    # Array-style workspaces
+    repo = _make_repo({
+        "package.json": '{"name":"mono","workspaces":["apps/*","packages/*"]}',
+    })
+    ws = _detect_node_workspaces(repo)
+    assert ws == ["apps/*", "packages/*"], f"Expected workspace globs, got {ws}"
+
+    # Object-style workspaces (npm/pnpm)
+    repo2 = _make_repo({
+        "package.json": '{"name":"mono","workspaces":{"packages":["apps/*"]}}',
+    })
+    ws2 = _detect_node_workspaces(repo2)
+    assert ws2 == ["apps/*"], f"Expected packages list, got {ws2}"
+
+    # No workspaces
+    repo3 = _make_repo({"package.json": '{"name":"plain"}'})
+    assert _detect_node_workspaces(repo3) is None
+    print("[OK] _detect_node_workspaces: detects array + object + none")
+
+
+def test_analyze_monorepo_no_root_entry():
+    """A monorepo (npm workspaces) with no root start script should get
+    a yellow NO RUNNABLE ENTRYPOINT verdict, NOT a red crash. The
+    Supabase fix: 'npm error Missing script: start' on a workspace repo
+    is not a crash — it's a missing root entrypoint."""
+    r = ExecutionResult(
+        stdout="",
+        stderr="npm error Missing script: \"start\"\nnpm error",
+        exit_code=1,
+        monorepo_no_root_entry=True,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert v.no_entrypoint is True, \
+        "Monorepo with no root entry must set no_entrypoint for yellow display"
+    assert v.monorepo is True
+    assert "monorepo" in v.detail.lower(), f"Expected 'monorepo' in detail, got {v.detail}"
+    print("[OK] analyze_result: monorepo no-root-entry -> yellow (not red crash)")
+
+
 # ----------------------------------------------------------------------
 # Verdict analysis tests (readiness-aware BOOTS semantics)
 # ----------------------------------------------------------------------
@@ -858,29 +901,30 @@ def test_parse_pypirc_netrc_are_medium():
 
 
 def test_parse_mixed_high_and_medium():
-    """A repo that reads both SSH keys (HIGH) and .npmrc (MEDIUM) must
-    classify them into separate tiers. HIGH triggers hard fail; MEDIUM
-    is informational only."""
+    """A repo that reads both SSH keys (HIGH) and .npmrc/.passwd (MEDIUM)
+    must classify them into separate tiers. HIGH triggers hard fail;
+    MEDIUM is informational only."""
     d = Path(tempfile.mkdtemp(prefix="trace-mixed-"))
     _write_trace(d, "trace.300", [
         'execve("/usr/local/bin/node", ["node", "index.js"], ...) = 0',
         'openat(AT_FDCWD, "/app/.npmrc", O_RDONLY) = 3',       # MEDIUM
         'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT',  # HIGH
-        'openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = 4',        # HIGH
+        'openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = 4',        # MEDIUM (libc reads it)
         '+++ exited with 0 +++',
     ])
     r = parse_strace_output(d)
-    # HIGH tier: SSH key + passwd
+    # HIGH tier: SSH key only (/etc/passwd is now MEDIUM — libc reads it)
     assert "/root/.ssh/id_rsa" in r.sensitive_access
-    assert "/etc/passwd" in r.sensitive_access
-    assert len(r.sensitive_access) == 2
-    # MEDIUM tier: .npmrc only
+    assert len(r.sensitive_access) == 1
+    # MEDIUM tier: .npmrc + /etc/passwd
     assert "/app/.npmrc" in r.medium_sensitive_access
-    assert len(r.medium_sensitive_access) == 1
+    assert "/etc/passwd" in r.medium_sensitive_access
+    assert len(r.medium_sensitive_access) == 2
     # No cross-contamination
     assert "/app/.npmrc" not in r.sensitive_access
+    assert "/etc/passwd" not in r.sensitive_access
     assert "/root/.ssh/id_rsa" not in r.medium_sensitive_access
-    print("[OK] parse_strace_output: HIGH and MEDIUM tiers separated correctly")
+    print("[OK] parse_strace_output: HIGH (ssh) and MEDIUM (.npmrc, /etc/passwd) tiers separated")
 
 
 def test_parse_runtime_noise_filtered():
@@ -940,6 +984,36 @@ def test_parse_multiple_distinct_writes():
         "/tmp/results.json",
     ], f"Expected sorted writes, got {r.files_written}"
     print("[OK] parse_strace_output: multiple distinct writes, sorted")
+
+
+def test_parse_blocked_writes_not_counted_as_written():
+    """Regression test: writes rejected by the read-only filesystem (open
+    returns -1 EROFS/EACCES) must be reported as 'blocked', not 'written'.
+
+    The Supabase bug: npm tried to write a debug log, the read-only FS
+    rejected it (stderr said 'Log files were not written due to an
+    error'), but the report counted it as 'Files Written 1'. That's
+    dishonest. Now: -1 return → writes_blocked, not files_written.
+    """
+    d = Path(tempfile.mkdtemp(prefix="trace-blocked-"))
+    _write_trace(d, "trace.100", [
+        'execve("/usr/local/bin/npm", ["npm", "start"], ...) = 0',
+        # Successful write to /tmp (writable via tmpfs)
+        'openat(AT_FDCWD, "/tmp/ok.log", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 4',
+        # BLOCKED write to /root/.npm/_logs (read-only FS rejects it)
+        'openat(AT_FDCWD, "/root/.npm/_logs/debug-0.log", O_WRONLY|O_CREAT|O_TRUNC, 0644) = -1 EROFS (Read-only file system)',
+        '+++ exited with 1 +++',
+    ])
+    r = parse_strace_output(d)
+    # Successful write
+    assert "/tmp/ok.log" in r.files_written, \
+        f"Expected /tmp/ok.log in files_written, got {r.files_written}"
+    # Blocked write — must be in writes_blocked, NOT files_written
+    assert "/root/.npm/_logs/debug-0.log" in r.writes_blocked, \
+        f"Expected blocked write in writes_blocked, got {r.writes_blocked}"
+    assert "/root/.npm/_logs/debug-0.log" not in r.files_written, \
+        f"Blocked write must NOT be in files_written, got {r.files_written}"
+    print("[OK] parse_strace_output: blocked writes reported as 'blocked' not 'written'")
 
 
 def test_parse_malformed_lines_ignored():
@@ -1267,6 +1341,7 @@ def run_all():
     test_detect_go()
     test_detect_rust()
     test_detect_unknown()
+    test_detect_node_workspaces()
 
     print()
     print("=" * 60)
@@ -1274,6 +1349,7 @@ def run_all():
     print("=" * 60)
     test_analyze_boots_yes()
     test_analyze_library_no_entrypoint()
+    test_analyze_monorepo_no_root_entry()
     test_analyze_boots_no()
     test_analyze_network_error_node()
     test_analyze_network_error_python()
@@ -1313,6 +1389,7 @@ def run_all():
     test_parse_runtime_noise_filtered()
     test_parse_dedup_across_forks()
     test_parse_multiple_distinct_writes()
+    test_parse_blocked_writes_not_counted_as_written()
     test_parse_malformed_lines_ignored()
     test_parse_ipv6_attempt()
     test_parse_unix_socket_recorded()
