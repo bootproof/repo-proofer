@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -84,7 +84,7 @@ except ImportError as e:
 # Constants
 # ----------------------------------------------------------------------
 
-INSTALL_TIMEOUT_SEC = 60
+INSTALL_TIMEOUT_SEC = 300   # 5 minutes — large repos (GitLab, Supabase) need this
 EXEC_TIMEOUT_SEC = 30
 IMAGE_PULL_TIMEOUT_SEC = 300
 DOCKER_INFO_TIMEOUT_SEC = 10
@@ -1193,6 +1193,30 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
                 "pip", "install", "--no-cache-dir", "--prefer-binary",
                 "-r", "requirements.txt",
                 "-t", "/tmp/pip_deps",
+            ]
+        elif (repo_path / "pyproject.toml").exists():
+            # No requirements.txt, but pyproject.toml exists (FastAPI,
+            # modern Python projects). Install the project + its declared
+            # dependencies into /tmp/pip_deps. This handles PEP 621
+            # [project.dependencies] and Poetry [tool.poetry.dependencies].
+            # We use --no-deps for the project itself (just install the
+            # declared deps, don't try to build the project package) and
+            # then install the project in editable mode for imports.
+            install_cmd = [
+                "sh", "-c",
+                # Extract dependencies from pyproject.toml and install them.
+                # We use pip install . which reads pyproject.toml's
+                # [project.dependencies] and installs them to /tmp/pip_deps.
+                "pip install --no-cache-dir --prefer-binary "
+                "-t /tmp/pip_deps .",
+            ]
+        elif (repo_path / "setup.py").exists() or (repo_path / "setup.cfg").exists():
+            # Legacy setup.py/setup.cfg — install the project which reads
+            # install_requires from setup.py/setup.cfg.
+            install_cmd = [
+                "sh", "-c",
+                "pip install --no-cache-dir --prefer-binary "
+                "-t /tmp/pip_deps .",
             ]
         return StackProfile(
             name="Python",

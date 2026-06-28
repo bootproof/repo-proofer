@@ -308,6 +308,52 @@ def test_detect_python_pyproject_no_main():
     print("[OK] detect_stack: Python (pyproject.toml-only, no entrypoint -> still detected)")
 
 
+def test_detect_python_pyproject_installs_deps():
+    """A pyproject.toml repo WITHOUT requirements.txt should install
+    via `pip install .` (reads [project.dependencies] from pyproject.toml).
+    This is the FastAPI case — it has pyproject.toml with starlette,
+    pydantic, etc. declared as dependencies, but no requirements.txt.
+    Without this install path, the exec phase crashes with
+    ModuleNotFoundError because deps were never installed."""
+    repo = _make_repo({
+        "pyproject.toml": (
+            "[project]\nname = \"fastapi\"\nversion = \"0.100.0\"\n"
+            "dependencies = [\"starlette\", \"pydantic\"]\n"
+        ),
+        "fastapi/__init__.py": "",
+        "fastapi/__main__.py": "print('fastapi')",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python"
+    # Must have an install_cmd that installs from pyproject.toml
+    assert s.install_cmd, f"Expected install_cmd for pyproject.toml repo, got empty"
+    install_str = " ".join(s.install_cmd)
+    assert "pip install" in install_str, \
+        f"Expected pip install in install_cmd, got {s.install_cmd}"
+    assert "/tmp/pip_deps" in install_str, \
+        f"Expected /tmp/pip_deps in install_cmd, got {s.install_cmd}"
+    assert s.deps_mount == "/tmp/pip_deps"
+    print("[OK] detect_stack: pyproject.toml repo installs deps via `pip install .`")
+
+
+def test_detect_python_setup_py_installs_deps():
+    """A setup.py repo without requirements.txt should install via
+    `pip install .` (reads install_requires from setup.py)."""
+    repo = _make_repo({
+        "setup.py": "from setuptools import setup\nsetup(name='x', install_requires=['flask'])",
+        "main.py": "print('hi')",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python"
+    assert s.install_cmd, f"Expected install_cmd for setup.py repo, got empty"
+    install_str = " ".join(s.install_cmd)
+    assert "pip install" in install_str
+    assert "/tmp/pip_deps" in install_str
+    print("[OK] detect_stack: setup.py repo installs deps via `pip install .`")
+
+
 def test_detect_python_console_scripts_pyproject():
     """A modern Python CLI that declares its entrypoint ONLY in
     [project.scripts] (no main.py) should produce a runnable
@@ -1829,6 +1875,8 @@ def run_all():
     test_detect_python_pyproject_toml()
     test_detect_python_setup_py()
     test_detect_python_pyproject_no_main()
+    test_detect_python_pyproject_installs_deps()
+    test_detect_python_setup_py_installs_deps()
     test_detect_python_console_scripts_pyproject()
     test_detect_python_console_scripts_poetry()
     test_detect_python_console_scripts_poetry_shorthand()
