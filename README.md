@@ -6,7 +6,6 @@
 
 <p align="center">
   <a href="https://pypi.org/project/repo-proofer/"><img src="https://img.shields.io/pypi/v/repo-proofer.svg?color=blue&label=PyPI&cacheSeconds=0" alt="PyPI"></a>
-  <a href="https://pypi.org/project/repo-proofer/"><img src="https://img.shields.io/pypi/dm/repo-proofer.svg?color=blue&label=downloads&cacheSeconds=0" alt="PyPI downloads"></a>
   <a href="https://pypi.org/project/repo-proofer/"><img src="https://img.shields.io/pypi/pyversions/repo-proofer.svg?color=blue&cacheSeconds=0" alt="Python versions"></a>
   <a href="https://github.com/bootproof/repo-proofer/actions"><img src="https://github.com/bootproof/repo-proofer/actions/workflows/ci.yml/badge.svg?cacheSeconds=0" alt="CI"></a>
   <a href="https://github.com/bootproof/repo-proofer/actions"><img src="https://github.com/bootproof/repo-proofer/actions/workflows/proofer.yml/badge.svg?cacheSeconds=0" alt="repo-proofer"></a>
