@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.6"
+__version__ = "0.5.7"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -124,6 +124,9 @@ NOT_FOUND_MARKERS = [
     "could not find cargo.toml",
     "error: could not find",
     "no entrypoint",
+    "missing command",       # Multi-command CLI (fastapi, django) needs a subcommand
+    "missing script",        # npm Missing script: start
+    "no module named",       # Python ImportError
 ]
 
 # ----------------------------------------------------------------------
@@ -1179,7 +1182,14 @@ def _detect_python_entrypoints(repo_path: Path) -> list[list[str]]:
         for entry in sorted((repo_path).iterdir()):
             if entry.is_dir() and not entry.name.startswith('.') \
                     and (entry / "__main__.py").exists():
-                candidates.append(["python", "-m", entry.name])
+                # Framework-specific subcommands: many frameworks (FastAPI,
+                # Django, etc.) have `python -m <pkg>` that requires a
+                # subcommand. Add the common ones so the tool actually
+                # starts a server instead of printing "Missing command."
+                pkg_name = entry.name
+                candidates.append(["python", "-m", pkg_name, "dev"])
+                candidates.append(["python", "-m", pkg_name, "run"])
+                candidates.append(["python", "-m", pkg_name])
                 break  # one is enough; deterministic via sorted()
 
     # 5. Console scripts from pyproject.toml / setup.cfg / setup.py.
