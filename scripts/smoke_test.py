@@ -20,7 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, "/home/z/my-project/download")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from proofer import (
     detect_stack,
     analyze_result,

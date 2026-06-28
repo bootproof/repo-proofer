@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -23,14 +24,23 @@ ENV/
 *~
 .DS_Store
 
-# Local artifacts (do not commit)
+# Local environment (do not commit)
 .env
 .env.*
 !.env.example
+
+# Local artifacts
 skills/
 node_modules/
 repo-proofer-*/
+repo-proofer-deps-*/
+repo-proofer-trace-*/
 *.log
 
 # OS
 Thumbs.db
+
+# Test fixture .git dirs — the fixture SOURCE is tracked, but we git-init
+# the fixtures locally so proofer.py can clone them via file:// URLs.
+# The .git directories themselves should never be committed.
+tests/fixtures/*/.git/

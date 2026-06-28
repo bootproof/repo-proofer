@@ -1,0 +1,2 @@
+# clean-repo has no third-party dependencies.
+# This file exists so repo-proofer's stack detector picks Python.

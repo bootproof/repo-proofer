@@ -1,0 +1,3 @@
+# QuantumGPT-Neo dependencies
+# (No actual packages listed because we don't actually use any.
+# The README did all the work.)

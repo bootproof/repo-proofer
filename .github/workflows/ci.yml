@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  deterministic-tests:
+    name: Deterministic unit tests (no Docker required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run deterministic smoke tests
+        run: python scripts/smoke_test.py
+
+  integration-tests:
+    name: Docker integration tests (full strace path)
+    runs-on: ubuntu-latest
+    needs: deterministic-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Initialize fixture git repos
+        run: python tests/integration_test.py --init-only
+
+      - name: Run Docker integration tests
+        run: python tests/integration_test.py
