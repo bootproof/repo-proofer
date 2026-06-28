@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -292,6 +292,28 @@ CRASH_SIGNATURES = [
 ]
 
 console = Console()
+
+
+def _extract_missing_command(stderr: str) -> Optional[str]:
+    """Extract the missing command name from a 'command not found' stderr.
+
+    Handles common patterns:
+      sh: 1: turbo: not found
+      bash: turbo: command not found
+      /bin/sh: turbo: not found
+      node: command not found
+    Returns the command name (e.g. "turbo") or None.
+    """
+    # Pattern: <shell>: <line>: <cmd>: not found  OR  <cmd>: command not found
+    m = re.search(r'(?:sh|bash|/bin/sh|dash):\s*\d+:\s*([^:]+):\s*(?:not found|command not found)',
+                  stderr, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Fallback: "<cmd>: command not found"
+    m = re.search(r'^([^:\s]+):\s*command not found', stderr, re.IGNORECASE | re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -1597,9 +1619,45 @@ def analyze_result(result: ExecutionResult) -> Verdict:
                 f"Use --keep-clone to inspect manually if unsure."
             )
     else:
-        # Non-zero exit, not a timeout — genuine crash or arg-error.
+        # Non-zero exit, not a timeout. Distinguish three distinct cases
+        # that all used to be flattened into "crash" — each means
+        # something different and deserves its own label:
+        #
+        #   127 = "command not found" — the launcher couldn't find a
+        #         build tool or binary (e.g. `turbo: not found` when
+        #         deps weren't fully installed). This is an environment
+        #         failure, not an application crash. The app never ran.
+        #
+        #   "Missing script" in stderr = npm couldn't find a start
+        #         script. Already handled by the monorepo detection
+        #         above, but if it slips through, label it honestly.
+        #
+        #   Any other non-zero = genuine application crash (traceback,
+        #         segfault, panic, exit 1 from running code).
         boots = False
-        detail = f"exited {result.exit_code} (crash)"
+        if result.exit_code == 127:
+            # Command not found — environment/dependency failure.
+            # Try to extract the missing command from stderr for detail.
+            missing_cmd = _extract_missing_command(result.stderr)
+            if missing_cmd:
+                detail = f"failed to start: '{missing_cmd}' not found (exit 127 — missing dependency or build tool)"
+            else:
+                detail = f"failed to start (exit 127 — command not found, likely missing dependency)"
+            warnings.append(
+                "The entrypoint couldn't start because a required tool "
+                "or dependency is missing from the sandbox. This is an "
+                "environment failure, not an application crash."
+            )
+        elif "missing script" in combined_lower:
+            # npm "Missing script: start" — no root entrypoint.
+            detail = "no runnable entrypoint (missing start script)"
+            warnings.append(
+                "No root entrypoint found. If this is a monorepo, "
+                "the entrypoint may live in a sub-package."
+            )
+        else:
+            # Genuine non-zero exit from running code.
+            detail = f"exited {result.exit_code} (crash)"
 
     return Verdict(
         boots=boots,
@@ -1954,9 +2012,9 @@ def print_behavior_report(report: BehaviorReport) -> None:
         console.print(Panel(
             "\n".join(f"- {p}" for p in report.medium_sensitive_access),
             title=(
-                f"[yellow]Package-Manager Config Access — MEDIUM "
+                f"[yellow]System/Config File Access — MEDIUM "
                 f"({len(report.medium_sensitive_access)})[/yellow]\n"
-                "[dim]Informational only — normal npm/pip behavior. "
+                "[dim]Informational only — routine reads by npm/pip/libc. "
                 "Review if unexpected.[/dim]"
             ),
             border_style="yellow",
@@ -2246,7 +2304,7 @@ def main(
         # MEDIUM-severity: informational note, NOT a hard fail.
         if behavior_report.medium_sensitive_access:
             console.print(
-                f"[yellow][i] Package-manager config access observed: "
+                f"[yellow][i] System/config file access observed (routine): "
                 f"{', '.join(behavior_report.medium_sensitive_access)}[/yellow]"
             )
 

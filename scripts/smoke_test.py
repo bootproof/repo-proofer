@@ -596,7 +596,67 @@ def test_analyze_boots_no():
     assert v.boots is False
     assert v.warnings == []
     assert "exited 1" in v.detail
-    print("[OK] analyze_result: exit 1 (no crash sig) -> BOOTS:NO")
+    assert "crash" in v.detail
+    print("[OK] analyze_result: exit 1 (no crash sig) -> BOOTS:NO, 'crash'")
+
+
+def test_analyze_exit_127_command_not_found():
+    """Exit 127 = 'command not found' — an environment failure, NOT an
+    application crash. The app never ran because a required tool/binary
+    is missing. The verdict should say 'failed to start' not 'crash'.
+
+    This is the formbricks case: `turbo: not found` because the monorepo's
+    build tool wasn't installed in the sandbox. Lumping 127 in with real
+    crashes flattened three distinct situations into one misleading label.
+    """
+    r = ExecutionResult(
+        stdout="",
+        stderr="sh: 1: turbo: not found",
+        exit_code=127,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert "failed to start" in v.detail, \
+        f"Exit 127 should say 'failed to start', got {v.detail}"
+    assert "turbo" in v.detail, \
+        f"Should extract missing command 'turbo', got {v.detail}"
+    assert "crash" not in v.detail.lower(), \
+        f"Exit 127 is NOT a crash — don't use that word, got {v.detail}"
+    assert any("environment failure" in w for w in v.warnings), \
+        f"Should warn about environment failure, got {v.warnings}"
+    print("[OK] analyze_result: exit 127 -> 'failed to start' (not 'crash')")
+
+
+def test_analyze_exit_127_no_command_extracted():
+    """Exit 127 with unparseable stderr should still say 'failed to start'."""
+    r = ExecutionResult(
+        stdout="",
+        stderr="some weird error",
+        exit_code=127,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert "failed to start" in v.detail
+    assert "command not found" in v.detail
+    print("[OK] analyze_result: exit 127 (unparseable) -> 'failed to start'")
+
+
+def test_analyze_missing_script_not_crash():
+    """'Missing script: start' in stderr should say 'no runnable entrypoint',
+    NOT 'crash'. This is the case where npm couldn't find a start script —
+    the entrypoint doesn't exist, the app didn't run and fall over."""
+    r = ExecutionResult(
+        stdout="",
+        stderr='npm error Missing script: "start"',
+        exit_code=1,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert "no runnable entrypoint" in v.detail, \
+        f"Missing script should say 'no runnable entrypoint', got {v.detail}"
+    assert "crash" not in v.detail.lower(), \
+        f"Missing script is NOT a crash, got {v.detail}"
+    print("[OK] analyze_result: Missing script -> 'no runnable entrypoint' (not 'crash')")
 
 
 def test_analyze_network_error_node():
@@ -1399,6 +1459,9 @@ def run_all():
     test_analyze_library_no_entrypoint()
     test_analyze_monorepo_no_root_entry()
     test_analyze_boots_no()
+    test_analyze_exit_127_command_not_found()
+    test_analyze_exit_127_no_command_extracted()
+    test_analyze_missing_script_not_crash()
     test_analyze_network_error_node()
     test_analyze_network_error_python()
     test_analyze_timeout_long_running()
