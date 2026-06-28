@@ -26,7 +26,7 @@ If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdi
 ## Features
 
 - **Zero AI.** Pure subprocess + filesystem + strace. Deterministic, fast, free to run forever.
-- **Hardened sandbox.** `--rm --read-only --network none --cap-drop ALL --memory 512m --cpus 0.5 --tmpfs /tmp`. The repo is mounted `:ro`. No exceptions.
+- **Hardened sandbox.** `--rm --read-only --network none --cap-drop ALL --memory 512m --cpus 0.5 --tmpfs /tmp` (Docker mode) or `--unshare-net --ro-bind --tmpfs /home --tmpfs /root` (native bubblewrap mode). The repo is always mounted `:ro`. No exceptions.
 - **Stack auto-detection.** Node.js, Python, Go (experimental), Rust (experimental) — picked by file-existence (`package.json`, `requirements.txt`/`pyproject.toml`/`setup.py`/`setup.cfg`/`main.py`, `go.mod`, `Cargo.toml`). Python entrypoints are resolved from `[project.scripts]` / `console_scripts` (modern CLI apps), `manage.py`, `src/` layouts, `__main__.py`, and conventional files — so a real Typer/Click CLI that declares its entrypoint only in `pyproject.toml` is correctly detected as runnable, not mislabeled as a library.
 - **Runtime Behavior Report.** When enabled (default), the entrypoint is wrapped in `strace -ff` inside the sandbox. After execution you get an SBOM-style report based on *actual execution, not static guessing*:
   - Files Read
@@ -248,11 +248,12 @@ Speed, reliability, and zero cost. A deterministic engine runs in seconds (warm 
 
 This tool is honest about what it can and can't do. The gaps below are real; workarounds are noted where they exist.
 
-- **First run is minutes, not seconds.** Before the first execution, repo-proofer must `docker pull` a base image (hundreds of MB) and `docker build` a derived strace image. Subsequent runs are fast (images are cached), but the first run on a fresh machine is a one-time cost.
+- **First run is minutes, not seconds — in Docker mode.** The Docker backend pulls base images (hundreds of MB) and builds a strace image. The native backend (bubblewrap, default on Linux) has no image pulls — it uses the host's runtimes directly and starts in milliseconds.
 - **Go and Rust are experimental.** Both run under `--network none` with no install step, so any project with external dependencies can't fetch them at runtime. Only zero-dependency or pre-vendored Go/Rust projects will boot. A future release may add a `go mod vendor` / `cargo vendor` install phase.
 - **Hostname-based C2 detection is indirect.** Under `--network none`, DNS resolution fails *before* `connect()`, so a hostname-based egress target shows up in the strace report as a DNS query to the resolver (e.g. `connect 192.168.65.7:53`), not as the actual hostname. Hardcoded-IP malware produces the clean `connect <IP>:<port>` line shown in the example above. The **Sensitive File Access** list is the strong, unambiguous signal regardless of how the app phones home.
 - **Install-phase residual risk.** The install phase runs with network ON (it has to, to fetch packages). We close the npm supply-chain window with `--ignore-scripts` (lifecycle scripts are NOT executed), and push pip toward wheels with `--prefer-binary`. However, pip packages that only ship as sdists will still trigger a PEP 517 build backend during install. This is a known residual risk; a future release may run the install phase under `--network none` with a pre-populated package cache.
-- **Docker is required.** This is the heaviest prerequisite for a consumer-triage tool. A future release may add a lighter default sandbox (bubblewrap/nsjail/seccomp) so people without Docker can get the 60-second payoff, with full Docker isolation reserved for `--strict`/enterprise use.
+- **Native sandbox is Linux-only.** Bubblewrap doesn't exist on macOS/Windows. On those platforms, `--sandbox auto` falls back to Docker. The native sandbox also has no memory/CPU limits (bubblewrap has no built-in cgroup controls) — the network + filesystem moat is fully intact, but a resource-exhaustion DoS isn't prevented. Use `--sandbox docker` for the full isolation profile.
+- **Docker is now optional.** The default `--sandbox auto` prefers the native bubblewrap sandbox (no Docker, no image pulls, millisecond startup). Docker is used as a fallback when bubblewrap isn't available (macOS/Windows) or when explicitly requested via `--sandbox docker`.
 
 ---
 
@@ -262,8 +263,8 @@ This tool is honest about what it can and can't do. The gaps below are real; wor
 - [x] `uvx` / `pipx` packaging (`pyproject.toml` + console script)
 - [x] Three-color verdict system (green/red/yellow — libraries are not slop)
 - [x] Console-script entrypoint detection (`[project.scripts]` / `console_scripts`)
+- [x] Docker-optional native sandbox (bubblewrap — `--sandbox auto/native/docker`)
 - [ ] Publish to PyPI (see [PUBLISH.md](PUBLISH.md) — package builds, publish is one command)
-- [ ] Docker-optional native sandbox (see [docs/DOCKER_OPTIONAL.md](docs/DOCKER_OPTIONAL.md) — the adoption-tax fix)
 - [ ] Phase 2: Cloud API + runtime-behavior database
 - [ ] Phase 3: Enterprise CI/CD gate (GitHub Actions / GitLab CI plugin)
 

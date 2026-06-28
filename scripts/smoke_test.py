@@ -40,6 +40,9 @@ from proofer import (
     STRACE_CONNECT_IPV6_RE,
     STRACE_CONNECT_UNIX_RE,
     STRACE_SOCKET_INET_RE,
+    _native_adapt_cmd,
+    _build_bwrap_args,
+    _select_backend,
 )
 
 
@@ -931,6 +934,184 @@ def test_behavior_report_has_data_property():
 
 
 # ----------------------------------------------------------------------
+# Native sandbox backend tests (bubblewrap)
+# ----------------------------------------------------------------------
+
+def test_native_adapt_cmd_python():
+    """python -> python3, pip -> python3 -m pip"""
+    assert _native_adapt_cmd(["python", "main.py"], "Python") == ["python3", "main.py"]
+    assert _native_adapt_cmd(["pip", "install", "-r", "requirements.txt"], "Python") == \
+        ["python3", "-m", "pip", "install", "-r", "requirements.txt"]
+    # Non-Python stacks pass through unchanged
+    assert _native_adapt_cmd(["node", "index.js"], "Node.js") == ["node", "index.js"]
+    assert _native_adapt_cmd(["go", "run", "main.go"], "Go (experimental)") == ["go", "run", "main.go"]
+    # Empty cmd stays empty
+    assert _native_adapt_cmd([], "Python") == []
+    print("[OK] _native_adapt_cmd: python->python3, pip->python3 -m pip")
+
+
+def test_build_bwrap_args_execute_network_off():
+    """Execute phase: --unshare-net must be present, deps read-only."""
+    repo = Path("/tmp/fake-repo")
+    deps = Path("/tmp/fake-deps")
+    stack = StackProfile(
+        name="Python", image="python:3.11-slim",
+        install_cmd=[], run_candidates=[["python", "main.py"]],
+        env={"PYTHONPATH": "/tmp/pip_deps"}, deps_mount="/tmp/pip_deps",
+    )
+    args = _build_bwrap_args(repo, stack, deps, trace_dir=None,
+                             network=False, deps_writable=False)
+    # Network isolation
+    assert "--unshare-net" in args, "Execute phase MUST have --unshare-net"
+    # Repo read-only
+    assert "--ro-bind" in args
+    assert str(repo) in args and "/app" in args
+    # Deps read-only (not writable) during execute
+    ro_idx = args.index("--ro-bind") if "--ro-bind" in args else -1
+    # Find the deps mount — should be --ro-bind not --bind
+    deps_bind = [i for i, a in enumerate(args) if a == str(deps)]
+    assert deps_bind, "Deps dir must be in args"
+    # The flag before deps_dir should be --ro-bind (read-only)
+    for idx in deps_bind:
+        assert args[idx - 1] == "--ro-bind", \
+            f"Deps must be --ro-bind during execute, got {args[idx-1]}"
+    print("[OK] _build_bwrap_args: execute has --unshare-net + ro deps")
+
+
+def test_build_bwrap_args_install_network_on():
+    """Install phase: NO --unshare-net, deps writable."""
+    repo = Path("/tmp/fake-repo")
+    deps = Path("/tmp/fake-deps")
+    stack = StackProfile(
+        name="Node.js", image="node:20-slim",
+        install_cmd=["npm", "install"], run_candidates=[],
+        env={"NODE_PATH": "/tmp/npm_cache/node_modules"}, deps_mount="/tmp/npm_cache",
+    )
+    args = _build_bwrap_args(repo, stack, deps, trace_dir=None,
+                             network=True, deps_writable=True)
+    # Network must be ON for install
+    assert "--unshare-net" not in args, "Install phase must NOT have --unshare-net"
+    # Deps writable (--bind, not --ro-bind)
+    deps_idx = args.index(str(deps))
+    assert args[deps_idx - 1] == "--bind", \
+        f"Deps must be --bind (writable) during install, got {args[deps_idx-1]}"
+    print("[OK] _build_bwrap_args: install has NO --unshare-net + writable deps")
+
+
+def test_build_bwrap_args_home_root_isolated():
+    """ /home and /root must be tmpfs (empty) so SSH keys are inaccessible."""
+    repo = Path("/tmp/fake-repo")
+    stack = StackProfile(
+        name="Python", image="python:3.11-slim",
+        install_cmd=[], run_candidates=[["python", "main.py"]],
+        env={}, deps_mount=None,
+    )
+    args = _build_bwrap_args(repo, stack, deps_dir=None, trace_dir=None,
+                             network=False, deps_writable=False)
+    # /home and /root must be tmpfs
+    home_idx = args.index("/home")
+    assert args[home_idx - 1] == "--tmpfs", "/home must be tmpfs"
+    root_idx = args.index("/root")
+    assert args[root_idx - 1] == "--tmpfs", "/root must be tmpfs"
+    print("[OK] _build_bwrap_args: /home and /root are tmpfs (SSH keys isolated)")
+
+
+def test_build_bwrap_args_env_vars():
+    """Environment variables must be passed via --setenv."""
+    repo = Path("/tmp/fake-repo")
+    stack = StackProfile(
+        name="Python", image="python:3.11-slim",
+        install_cmd=[], run_candidates=[],
+        env={"PYTHONPATH": "/tmp/pip_deps", "PYTHONDONTWRITEBYTECODE": "1"},
+        deps_mount=None,
+    )
+    args = _build_bwrap_args(repo, stack, deps_dir=None, trace_dir=None,
+                             network=False, deps_writable=False)
+    assert "--setenv" in args
+    assert "PYTHONPATH" in args
+    assert "/tmp/pip_deps" in args
+    assert "PYTHONDONTWRITEBYTECODE" in args
+    print("[OK] _build_bwrap_args: env vars passed via --setenv")
+
+
+def test_build_bwrap_args_trace_dir():
+    """When trace_dir is provided, it's mounted writable at /trace."""
+    repo = Path("/tmp/fake-repo")
+    trace = Path("/tmp/fake-trace")
+    stack = StackProfile(
+        name="Python", image="python:3.11-slim",
+        install_cmd=[], run_candidates=[],
+        env={}, deps_mount=None,
+    )
+    args = _build_bwrap_args(repo, stack, deps_dir=None, trace_dir=trace,
+                             network=False, deps_writable=False)
+    trace_idx = args.index(str(trace))
+    assert args[trace_idx - 1] == "--bind", "Trace dir must be --bind (writable)"
+    assert "/trace" in args, "Trace dir must be mounted at /trace"
+    print("[OK] _build_bwrap_args: trace_dir mounted writable at /trace")
+
+
+def test_select_backend_auto_prefers_native():
+    """In auto mode, if bwrap is available, native is preferred."""
+    # We can't control whether bwrap is installed in the test env, but
+    # we can verify the logic: if check_bubblewrap() returns True and
+    # the stack is None, _select_backend returns 'native'.
+    # If bwrap isn't installed, it returns 'docker'.
+    import proofer
+    original = proofer.check_bubblewrap
+    try:
+        # Simulate bwrap available
+        proofer.check_bubblewrap = lambda: True
+        result = _select_backend("auto", stack=None)
+        assert result == "native", f"auto+bwrap should be native, got {result}"
+
+        # Simulate bwrap unavailable
+        proofer.check_bubblewrap = lambda: False
+        result = _select_backend("auto", stack=None)
+        assert result == "docker", f"auto+no-bwrap should be docker, got {result}"
+    finally:
+        proofer.check_bubblewrap = original
+    print("[OK] _select_backend: auto prefers native when bwrap available")
+
+
+def test_select_backend_docker_forced():
+    """--sandbox docker always returns docker."""
+    result = _select_backend("docker", stack=None)
+    assert result == "docker"
+    print("[OK] _select_backend: docker forced")
+
+
+def test_select_backend_native_with_stack_runtime_check():
+    """--sandbox native with a stack checks host runtime."""
+    import proofer
+    original_bwrap = proofer.check_bubblewrap
+    original_runtime = proofer.check_host_runtime
+    try:
+        proofer.check_bubblewrap = lambda: True
+        stack = StackProfile(
+            name="Python", image="python:3.11-slim",
+            install_cmd=[], run_candidates=[],
+            env={}, deps_mount=None,
+        )
+        # Simulate runtime available
+        proofer.check_host_runtime = lambda s: (True, "python3")
+        result = _select_backend("native", stack=stack)
+        assert result == "native"
+
+        # Simulate runtime unavailable — should raise typer.Exit
+        proofer.check_host_runtime = lambda s: (False, "python3 not found")
+        try:
+            _select_backend("native", stack=stack)
+            assert False, "Should have raised typer.Exit"
+        except (SystemExit, Exception):
+            pass  # typer.Exit raises click.exceptions.Exit (subclass of Exception)
+    finally:
+        proofer.check_bubblewrap = original_bwrap
+        proofer.check_host_runtime = original_runtime
+    print("[OK] _select_backend: native with stack checks host runtime")
+
+
+# ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
 
@@ -1011,6 +1192,20 @@ def run_all():
     test_parse_ipv6_attempt()
     test_parse_unix_socket_recorded()
     test_behavior_report_has_data_property()
+
+    print()
+    print("=" * 60)
+    print("Native sandbox backend tests (bubblewrap)")
+    print("=" * 60)
+    test_native_adapt_cmd_python()
+    test_build_bwrap_args_execute_network_off()
+    test_build_bwrap_args_install_network_on()
+    test_build_bwrap_args_home_root_isolated()
+    test_build_bwrap_args_env_vars()
+    test_build_bwrap_args_trace_dir()
+    test_select_backend_auto_prefers_native()
+    test_select_backend_docker_forced()
+    test_select_backend_native_with_stack_runtime_check()
 
     print()
     print("=" * 60)

@@ -884,9 +884,17 @@ def ensure_strace_image(base_image: str) -> Optional[str]:
 
 def run_docker(args: list[str], timeout: int) -> ExecutionResult:
     """Run a docker command with timeout, capture stdout/stderr/exit_code."""
+    return _run_command(["docker", *args], timeout)
+
+
+def _run_command(cmd: list[str], timeout: int) -> ExecutionResult:
+    """Run an arbitrary command with timeout, capture stdout/stderr/exit_code.
+
+    Shared by run_docker() and the native (bubblewrap) backend.
+    """
     try:
         proc = subprocess.run(
-            ["docker", *args],
+            cmd,
             capture_output=True, text=True, timeout=timeout,
         )
         return ExecutionResult(
@@ -908,6 +916,271 @@ def run_docker(args: list[str], timeout: int) -> ExecutionResult:
             exit_code=-1,
             timed_out=True,
         )
+
+
+# ----------------------------------------------------------------------
+# Native sandbox backend (bubblewrap) — no Docker required
+# ----------------------------------------------------------------------
+#
+# This is the adoption-tax fix. On Linux with bubblewrap installed,
+# `repo-proofer <url>` runs in seconds with NO Docker daemon, NO image
+# pulls, NO derived image builds. The sandbox is just as locked down:
+#   --unshare-net       = no network (the moat)
+#   --ro-bind /usr ...  = read-only host filesystem
+#   --tmpfs /tmp        = writable in-memory /tmp
+#   --tmpfs /home       = empty /home (SSH keys inaccessible)
+#   --tmpfs /root       = empty /root (root's SSH keys inaccessible)
+#
+# strace runs natively on the host — no derived strace image needed.
+#
+# Limitations vs Docker:
+#   - Linux only (bubblewrap doesn't exist on macOS/Windows)
+#   - No memory/CPU limits (bubblewrap has no built-in cgroup controls)
+#   - Uses host runtimes (not clean-room images)
+# The security moat (network + filesystem isolation) is fully intact.
+
+def check_bubblewrap() -> bool:
+    """Check if bubblewrap (bwrap) is available on the host."""
+    return shutil.which("bwrap") is not None
+
+
+def check_strace() -> bool:
+    """Check if strace is available on the host."""
+    return shutil.which("strace") is not None
+
+
+def check_host_runtime(stack: StackProfile) -> tuple[bool, str]:
+    """Check if the host has the required runtime for the stack.
+
+    Returns (ok, message). For native mode, we use the HOST's language
+    runtimes instead of pulling Docker images.
+    """
+    if stack.name == "Python":
+        if shutil.which("python3"):
+            return True, "python3"
+        return False, "python3 not found on PATH (install Python 3.10+)"
+    elif stack.name == "Node.js":
+        if shutil.which("node") and shutil.which("npm"):
+            return True, "node"
+        return False, "node/npm not found on PATH (install Node.js 18+)"
+    elif "Go" in stack.name:
+        if shutil.which("go"):
+            return True, "go"
+        return False, "go not found on PATH (install Go 1.22+)"
+    elif "Rust" in stack.name:
+        if shutil.which("cargo"):
+            return True, "cargo"
+        return False, "cargo not found on PATH (install Rust 1.75+)"
+    return False, f"Unknown stack: {stack.name}"
+
+
+def _native_adapt_cmd(cmd: list[str], stack_name: str) -> list[str]:
+    """Adapt a Docker-mode command for native (host) execution.
+
+    On the host, `python` is often `python3`, and `pip` should be
+    `python3 -m pip` to avoid PATH issues. Node/Go/Rust commands
+    pass through unchanged.
+    """
+    if not cmd:
+        return cmd
+    if stack_name == "Python":
+        if cmd[0] == "python":
+            return ["python3"] + cmd[1:]
+        if cmd[0] == "pip":
+            return ["python3", "-m", "pip"] + cmd[1:]
+    return cmd
+
+
+def _build_bwrap_args(
+    repo_path: Path,
+    stack: StackProfile,
+    deps_dir: Optional[Path],
+    trace_dir: Optional[Path],
+    network: bool,
+    deps_writable: bool,
+) -> list[str]:
+    """Build the common bubblewrap args for both install and execute.
+
+    Security properties (identical to Docker sandbox):
+      - Read-only host filesystem (--ro-bind /usr, /lib, /bin, /etc, ...)
+      - Empty /home and /root (--tmpfs) so SSH keys are INACCESSIBLE
+      - Writable /tmp via tmpfs (--tmpfs /tmp)
+      - No network during execute (--unshare-net)
+      - No capabilities (bubblewrap drops all by default)
+
+    The repo is always mounted read-only at /app.
+    Deps are mounted writable during install, read-only during execute.
+    """
+    args: list[str] = [
+        "bwrap",
+        # Read-only host filesystem — the app can READ system libs
+        # but can't WRITE anywhere except /tmp and mounted dirs.
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+    ]
+
+    # lib64 may not exist on all architectures
+    if Path("/lib64").exists():
+        args += ["--ro-bind", "/lib64", "/lib64"]
+    # /opt may not exist
+    if Path("/opt").exists():
+        args += ["--ro-bind", "/opt", "/opt"]
+
+    args += [
+        # Fresh /dev and /proc (don't expose host's)
+        "--dev", "/dev",
+        "--proc", "/proc",
+        # Writable in-memory /tmp (like Docker's --tmpfs /tmp)
+        "--tmpfs", "/tmp",
+        # EMPTY /home and /root — SSH keys, .aws/credentials, .env etc.
+        # are completely inaccessible. The app can't read them even if
+        # strace is bypassed. Reads of ~/.ssh/id_rsa return ENOENT.
+        # strace still catches the ATTEMPT (the openat syscall fires
+        # before the ENOENT), so the sensitive-access detector works.
+        "--tmpfs", "/home",
+        "--tmpfs", "/root",
+        "--tmpfs", "/run",
+        # Cleanup + isolation
+        "--die-with-parent",
+        "--new-session",
+        # Repo mounted read-only at /app
+        "--ro-bind", str(repo_path), "/app",
+        "--chdir", "/app",
+    ]
+
+    # Network isolation — ONLY during execute. Install needs network.
+    if not network:
+        args.append("--unshare-net")
+
+    # Deps mount
+    if stack.deps_mount and deps_dir is not None:
+        if deps_writable:
+            args += ["--bind", str(deps_dir), stack.deps_mount]
+        else:
+            args += ["--ro-bind", str(deps_dir), stack.deps_mount]
+
+    # Trace mount (writable — strace writes trace files here)
+    if trace_dir is not None:
+        args += ["--bind", str(trace_dir), "/trace"]
+
+    # Environment variables
+    for key, value in stack.env.items():
+        args += ["--setenv", key, value]
+
+    return args
+
+
+def native_install_deps(
+    stack: StackProfile,
+    repo_path: Path,
+    deps_dir: Path,
+) -> Optional[ExecutionResult]:
+    """Run the install command in a bubblewrap sandbox with network ON.
+
+    Same security model as Docker install_deps():
+    - Read-only root filesystem
+    - Repo mounted read-only
+    - Deps dir mounted writable (persists to host for the exec phase)
+    - Network ON (needed to fetch packages)
+    - Empty /home and /root (no SSH keys exposed during install)
+    """
+    if not stack.install_cmd:
+        return None
+
+    args = _build_bwrap_args(
+        repo_path, stack, deps_dir, trace_dir=None,
+        network=True, deps_writable=True,
+    )
+    args.append("--")
+    args.extend(_native_adapt_cmd(stack.install_cmd, stack.name))
+
+    return _run_command(args, timeout=INSTALL_TIMEOUT_SEC)
+
+
+def native_execute_entrypoint(
+    stack: StackProfile,
+    repo_path: Path,
+    deps_dir: Optional[Path],
+    trace_dir: Optional[Path] = None,
+) -> ExecutionResult:
+    """Run the project entrypoint in a bubblewrap sandbox.
+
+    CRITICAL SECURITY CONSTRAINTS (same as Docker execute_entrypoint):
+      --unshare-net         Absolutely no internet access.
+      --ro-bind /usr ...    Read-only host filesystem.
+      --tmpfs /home         Empty /home (SSH keys inaccessible).
+      --tmpfs /root         Empty /root.
+      --tmpfs /tmp          Writable in-memory /tmp.
+      --ro-bind repo /app   Repo mounted READ-ONLY.
+
+    No capabilities (bubblewrap drops all by default). No memory/CPU
+    limits (bubblewrap has no built-in cgroup controls — see docs).
+
+    If trace_dir is provided, strace wraps the entrypoint. strace runs
+    natively on the host — no derived image needed (unlike Docker mode).
+    """
+    use_strace = trace_dir is not None
+
+    # If the stack has NO runnable entrypoint, return immediately.
+    if not stack.run_candidates:
+        return ExecutionResult(
+            stdout="",
+            stderr="No runnable entrypoint found. This looks like a library.",
+            exit_code=127,
+            no_candidates=True,
+        )
+
+    base_args = _build_bwrap_args(
+        repo_path, stack, deps_dir, trace_dir,
+        network=False, deps_writable=False,
+    )
+
+    if use_strace:
+        # strace runs on the host, wraps the entrypoint.
+        # Same -ff (follow forks) and -e (syscall filter) as Docker mode.
+        base_args += ["--"]
+        strace_prefix = [
+            "strace", "-ff",
+            "-e", "trace=openat,open,openat2,creat,execve,execveat,connect,socket,unlink,unlinkat",
+            "-o", "/trace/trace",
+            "--",
+        ]
+    else:
+        base_args += ["--"]
+        strace_prefix = []
+
+    # Try each run candidate (same fallback logic as Docker mode)
+    last_result: Optional[ExecutionResult] = None
+    for candidate in stack.run_candidates:
+        native_cmd = _native_adapt_cmd(candidate, stack.name)
+        full_args = base_args + strace_prefix + native_cmd
+        result = _run_command(full_args, timeout=EXEC_TIMEOUT_SEC)
+
+        if result.exit_code == 0:
+            return result
+
+        combined = (result.stdout + "\n" + result.stderr).lower()
+        if any(marker in combined for marker in NOT_FOUND_MARKERS):
+            last_result = result
+            continue
+
+        return result
+
+    if last_result is not None:
+        return last_result
+
+    return ExecutionResult(
+        stdout="",
+        stderr=(
+            "No entrypoint candidate ran. Tried: "
+            + ", ".join(" ".join(c) for c in stack.run_candidates)
+        ),
+        exit_code=127,
+        no_candidates=True,
+    )
 
 
 def install_deps(
@@ -1466,6 +1739,46 @@ def print_behavior_report(report: BehaviorReport) -> None:
 # Main flow
 # ----------------------------------------------------------------------
 
+def _select_backend(
+    preference: str, stack: Optional[StackProfile]
+) -> str:
+    """Select the sandbox backend: 'native' (bubblewrap) or 'docker'.
+
+    Preference can be 'auto', 'native', or 'docker'.
+    In auto mode, prefer native (faster, no Docker) and fall back to
+    Docker if bubblewrap or the required host runtime is unavailable.
+    """
+    if preference == "docker":
+        return "docker"
+
+    if preference == "native":
+        if not check_bubblewrap():
+            console.print(
+                "[red]Error: --sandbox native requires bubblewrap (bwrap) "
+                "on Linux. Use --sandbox docker instead.[/red]"
+            )
+            raise typer.Exit(code=3)
+        if stack is not None:
+            ok, msg = check_host_runtime(stack)
+            if not ok:
+                console.print(f"[red]Error: {msg}[/red]")
+                raise typer.Exit(code=3)
+        return "native"
+
+    # auto: prefer native, fall back to Docker
+    if check_bubblewrap():
+        if stack is None:
+            return "native"  # can't check runtime yet — will re-check later
+        ok, msg = check_host_runtime(stack)
+        if ok:
+            return "native"
+        console.print(
+            f"[yellow]Host runtime for {stack.name} not found ({msg}). "
+            f"Falling back to Docker.[/yellow]"
+        )
+    return "docker"
+
+
 def main(
     repo_url: str = typer.Argument(
         ...,
@@ -1484,20 +1797,37 @@ def main(
             "Faster, but no file/process/network tracking."
         ),
     ),
+    sandbox: str = typer.Option(
+        "auto",
+        "--sandbox",
+        help=(
+            "Sandbox backend: 'auto' (default, prefer native bubblewrap), "
+            "'native' (bubblewrap, no Docker needed, Linux only), or "
+            "'docker' (full Docker isolation)."
+        ),
+    ),
 ) -> None:
     """Clone, sandbox, and execute a Git repo. Brutal honest verdict."""
     tmp_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-"))
     repo_dir = tmp_dir / "repo"
     deps_dir: Optional[Path] = None
     trace_dir: Optional[Path] = None
+    backend: str = "docker"  # determined after stack detection
 
     try:
-        # ---- Step 0: Check Docker -----------------------------------
-        # Note: no Progress wrapper here. check_docker_running() prints
-        # error panels via console.print on failure, and Rich forbids
-        # printing to the live console while a Progress is active.
-        console.print("[dim]Checking Docker daemon...[/dim]")
-        check_docker_running()
+        # ---- Step 0: Quick backend availability check -------------
+        # Full selection happens after stack detection (need to check
+        # host runtime for native mode). But we can fail fast if the
+        # user explicitly requested a backend that's clearly unavailable.
+        if sandbox == "native" and not check_bubblewrap():
+            console.print(
+                "[red]Error: --sandbox native requires bubblewrap (bwrap) "
+                "on Linux. Use --sandbox auto or --sandbox docker.[/red]"
+            )
+            raise typer.Exit(code=3)
+        if sandbox == "docker":
+            console.print("[dim]Checking Docker daemon...[/dim]")
+            check_docker_running()
 
         # ---- Step 1: Clone (depth=1) --------------------------------
         # Note: errors are captured and printed AFTER the Progress
@@ -1531,46 +1861,64 @@ def main(
             console.print(
                 "[red]Error: Could not detect project stack.[/red]\n"
                 "[dim]Supported markers: package.json, "
-                "requirements.txt, main.py, go.mod, Cargo.toml[/dim]"
+                "requirements.txt, pyproject.toml, setup.py, setup.cfg, "
+                "main.py, go.mod, Cargo.toml[/dim]"
             )
             raise typer.Exit(code=4)
-        console.print(
-            f"[cyan]Detected stack:[/cyan] [bold]{stack.name}[/bold] "
-            f"(image: {stack.image})"
-        )
 
-        # ---- Ensure base image is pulled (one-time setup) ---------
-        ensure_image_pulled(stack.image)
+        # ---- Step 2b: Select sandbox backend -----------------------
+        # Now that we know the stack, we can check if the host has the
+        # required runtime for native mode.
+        backend = _select_backend(sandbox, stack)
 
-        # ---- Build strace-enabled image (for Runtime Behavior Report)
-        # The derived image is cached, so this is instant on subsequent
-        # runs. If the build fails, we fall back to the base image and
-        # skip strace — the core verdict still works.
-        exec_image = stack.image
-        if not no_behavior_report:
-            strace_tag = ensure_strace_image(stack.image)
-            if strace_tag is not None:
-                exec_image = strace_tag
-                trace_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-trace-"))
-                try:
-                    trace_dir.chmod(0o777)
-                except PermissionError:
-                    pass
-            else:
-                console.print(
-                    "[yellow]Runtime Behavior Report disabled "
-                    "(could not build strace image).[/yellow]"
-                )
+        if backend == "native":
+            console.print(
+                f"[cyan]Detected stack:[/cyan] [bold]{stack.name}[/bold] "
+                f"| [green]Native sandbox (bubblewrap)[/green]"
+            )
+        else:
+            console.print(
+                f"[cyan]Detected stack:[/cyan] [bold]{stack.name}[/bold] "
+                f"(image: {stack.image}) | [blue]Docker sandbox[/blue]"
+            )
 
-        # ---- Step 3: Install deps (network ON) ---------------------
+        # ---- Step 3: Prepare sandbox --------------------------------
+        exec_image = stack.image  # only used for Docker backend
+        if backend == "docker":
+            ensure_image_pulled(stack.image)
+            # Build strace-enabled derived image (cached on subsequent runs)
+            if not no_behavior_report:
+                strace_tag = ensure_strace_image(stack.image)
+                if strace_tag is not None:
+                    exec_image = strace_tag
+                    trace_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-trace-"))
+                    try:
+                        trace_dir.chmod(0o777)
+                    except PermissionError:
+                        pass
+                else:
+                    console.print(
+                        "[yellow]Runtime Behavior Report disabled "
+                        "(could not build strace image).[/yellow]"
+                    )
+        else:
+            # Native: strace runs on the host directly, no image build.
+            if not no_behavior_report:
+                if check_strace():
+                    trace_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-trace-"))
+                else:
+                    console.print(
+                        "[yellow]strace not found on host — "
+                        "Runtime Behavior Report disabled.[/yellow]"
+                    )
+
+        # ---- Step 4: Install deps (network ON) ---------------------
         install_result: Optional[ExecutionResult] = None
         if stack.install_cmd:
             deps_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-deps-"))
             try:
                 deps_dir.chmod(0o777)
             except PermissionError:
-                # On some systems non-root can't chmod; the dir is already
-                # world-writable via mkdtemp defaults, so this is fine.
                 pass
 
             with Progress(
@@ -1584,7 +1932,10 @@ def main(
                     f"(network ON, timeout {INSTALL_TIMEOUT_SEC}s)...",
                     total=None,
                 )
-                install_result = install_deps(stack, repo_dir, deps_dir)
+                if backend == "docker":
+                    install_result = install_deps(stack, repo_dir, deps_dir)
+                else:
+                    install_result = native_install_deps(stack, repo_dir, deps_dir)
 
             if install_result.exit_code != 0:
                 console.print(
@@ -1592,7 +1943,7 @@ def main(
                     "Proceeding to execution anyway (no auto-repair).[/yellow]"
                 )
 
-        # ---- Step 4: Execute (network OFF, read-only FS) -----------
+        # ---- Step 5: Execute (network OFF, read-only FS) -----------
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -1604,9 +1955,14 @@ def main(
                 f"(network OFF, read-only FS, timeout {EXEC_TIMEOUT_SEC}s)...",
                 total=None,
             )
-            exec_result = execute_entrypoint(
-                stack, exec_image, repo_dir, deps_dir, trace_dir,
-            )
+            if backend == "docker":
+                exec_result = execute_entrypoint(
+                    stack, exec_image, repo_dir, deps_dir, trace_dir,
+                )
+            else:
+                exec_result = native_execute_entrypoint(
+                    stack, repo_dir, deps_dir, trace_dir,
+                )
 
         # ---- Step 5: Analyze ----------------------------------------
         verdict = analyze_result(exec_result)

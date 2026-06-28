@@ -1,6 +1,15 @@
 # Design: Docker-Optional Sandbox (The Adoption Tax Fix)
 
-## Status: Design spec — not yet implemented
+## Status: IMPLEMENTED — native bubblewrap sandbox is live
+
+The `--sandbox` flag is now available with three modes:
+- `--sandbox auto` (default): prefer native (bubblewrap), fall back to Docker
+- `--sandbox native`: force bubblewrap (Linux only, no Docker needed)
+- `--sandbox docker`: force Docker (full isolation, clean-room images)
+
+On a Linux machine with bubblewrap installed, `repo-proofer <url>` now
+runs in seconds with **no Docker daemon, no image pulls, no derived image
+builds**. This is the adoption-tax fix.
 
 ## Problem
 
