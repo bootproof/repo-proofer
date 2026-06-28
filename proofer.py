@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -2909,6 +2909,7 @@ def main(
     deps_dir: Optional[Path] = None
     trace_dir: Optional[Path] = None
     backend: str = "docker"  # determined after stack detection
+    security_scanning_disabled: bool = False
 
     try:
         # ---- Step 0: Quick backend availability check -------------
@@ -3003,10 +3004,32 @@ def main(
                 if check_strace():
                     trace_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-trace-"))
                 else:
-                    console.print(
-                        "[yellow]strace not found on host — "
-                        "Runtime Behavior Report disabled.[/yellow]"
-                    )
+                    # LOUD warning — this is the flagship capability being
+                    # disabled. A false-clean verdict (green BOOTS:YES on a
+                    # repo that quietly read ~/.ssh) is the cardinal sin for
+                    # a trust tool. Print this BEFORE execution so the user
+                    # sees it immediately, not buried in a report panel.
+                    # Also set a flag so the verdict renderer can add a
+                    # warning to the verdict panel itself.
+                    security_scanning_disabled = True
+                    console.print(Panel(
+                        "[bold red]\u26a0  SECURITY SCANNING DISABLED[/bold red]\n\n"
+                        "strace is not installed on this host. Without strace, "
+                        "repo-proofer CANNOT detect:\n"
+                        "  \u2022 SSH key theft (~/.ssh/id_rsa)\n"
+                        "  \u2022 AWS credential reads (.aws/credentials)\n"
+                        "  \u2022 .env file exfiltration\n"
+                        "  \u2022 Network phone-home attempts (C2 connect targets)\n\n"
+                        "The verdict will still tell you if the repo boots, but "
+                        "[bold red]a repo that reads your keys and exits 0 will "
+                        "show BOOTS: YES[/bold red] \u2014 a false-clean result.\n\n"
+                        "[bold green]Fix:[/bold green]  apt install strace\n"
+                        "        (Debian/Ubuntu)  or  dnf install strace  (Fedora)\n"
+                        "Then re-run repo-proofer for full security detection.",
+                        title="[bold red]Missing strace \u2014 exfil detection off[/bold red]",
+                        border_style="red",
+                        expand=False,
+                    ))
 
         # ---- Step 4: Install deps (network ON) ---------------------
         install_result: Optional[ExecutionResult] = None
@@ -3069,6 +3092,12 @@ def main(
             behavior_report = parse_strace_output(trace_dir)
 
         # ---- Step 6: Print verdict ----------------------------------
+        if security_scanning_disabled:
+            verdict.warnings.append(
+                "SECURITY SCANNING WAS DISABLED (strace not installed). "
+                "This verdict CANNOT detect SSH key theft, credential "
+                "reads, or network exfil. Install strace and re-run."
+            )
         print_verdict(verdict, repo_url, stack.name, install_result)
         print_behavior_report(behavior_report)
 
