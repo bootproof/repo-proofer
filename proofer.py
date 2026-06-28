@@ -42,22 +42,41 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import typer
-from git import Repo, GitCommandError
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
-from rich.table import Table
+# ----------------------------------------------------------------------
+# Missing-dependency guard — print a guided message instead of a raw
+# traceback. This is the first code that runs; if typer/rich/gitpython
+# aren't installed, the user gets a clear "run pip install" instruction
+# rather than an ImportError stack trace.
+# ----------------------------------------------------------------------
+try:
+    import typer
+    from git import Repo, GitCommandError
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    from rich.table import Table
+except ImportError as e:
+    print(f"Error: missing dependency '{e.name}'.")
+    print()
+    print("repo-proofer requires typer, rich, and GitPython.")
+    print("Install them with:")
+    print()
+    print("    pip install -r requirements.txt")
+    print()
+    print("(If you hit 'externally-managed-environment' on macOS/Linux,")
+    print(" create a venv first:  python3 -m venv .venv && source .venv/bin/activate)")
+    sys.exit(1)
 
 # ----------------------------------------------------------------------
 # Constants
@@ -199,6 +218,54 @@ SENSITIVE_PATH_PATTERNS = [
     re.compile(r'\.env\.'),
 ]
 
+# ----------------------------------------------------------------------
+# Readiness signals — used to distinguish a healthy long-running
+# process (server, daemon, bot) from a crashed one.
+#
+# The previous logic was: exit_code == 0 -> BOOTS:YES, anything else ->
+# BOOTS:NO. That meant every server, daemon, and bot (which by design
+# never exit on their own) was marked "does not boot" — a false
+# negative on exactly the repos people most want to triage.
+#
+# The new logic: if a process times out WITHOUT a crash signature in
+# its stderr, it stayed alive — that's a pass for a server. If it also
+# printed a readiness signal ("listening on", "started", "ready",
+# "Uvicorn running", "Flask running", etc.), we upgrade to a strong
+# server-detected YES with the matched signal shown.
+# ----------------------------------------------------------------------
+READINESS_SIGNAL_PATTERNS = [
+    re.compile(r'listening\s+on\s+(?:port\s+)?\d+', re.IGNORECASE),
+    re.compile(r'listening\s+at\s+', re.IGNORECASE),
+    re.compile(r'server\s+started', re.IGNORECASE),
+    re.compile(r'\bstarted\b.*\bserver\b', re.IGNORECASE),
+    re.compile(r'\bready\b.*\b(?:listen|serv|accept)', re.IGNORECASE),
+    re.compile(r'uvicorn\s+running', re.IGNORECASE),
+    re.compile(r'flask\s+running', re.IGNORECASE),
+    re.compile(r'gunicorn\s+\(?:starting|booting\)', re.IGNORECASE),
+    re.compile(r'serving\s+(?:on|at)\s+', re.IGNORECASE),
+    re.compile(r'bound\s+to\s+(?:port\s+)?\d+', re.IGNORECASE),
+    re.compile(r'app\s+running', re.IGNORECASE),
+    re.compile(r'webpack\s+(?:compiled|dev.*server)', re.IGNORECASE),
+    re.compile(r'now\s+listening', re.IGNORECASE),
+    re.compile(r'connected\s+to\s+database', re.IGNORECASE),
+    re.compile(r'worker\s+(?:started|ready)', re.IGNORECASE),
+]
+
+# Crash signatures — if any of these appear in stderr, the process
+# genuinely failed (not just timed out). Their presence overrides the
+# "timed out = stayed alive = pass" rule.
+CRASH_SIGNATURES = [
+    'traceback (most recent call last)',
+    'panic:',
+    'fatal error:',
+    'uncaught exception',
+    'segmentation fault',
+    'core dumped',
+    'error: ',
+    'killed',
+    'out of memory',
+]
+
 console = Console()
 
 
@@ -235,6 +302,10 @@ class Verdict:
     stdout_preview: str
     stderr_preview: str
     warnings: list[str] = field(default_factory=list)
+    # Human-readable one-liner explaining WHY boots is YES or NO.
+    # Examples: "exited 0", "long-running process (timed out at 30s, no crash)",
+    #           "server detected: listening on port 8080", "exited 1 (crash)"
+    detail: str = ""
 
 
 @dataclass
@@ -266,46 +337,182 @@ class BehaviorReport:
 # Stack detection — deterministic, file-existence based
 # ----------------------------------------------------------------------
 
+def _detect_node_entrypoints(repo_path: Path) -> list[list[str]]:
+    """Read package.json to pick entrypoints deterministically.
+
+    Order of preference (matches how Node developers actually structure
+    apps):
+      1. scripts.start     (npm start — the manifest's own declaration)
+      2. main field        (node <main> — the manifest's own declaration)
+      3. bin field         (node <bin> — CLI tools)
+      4. index.js          (Node convention)
+      5. app.js            (common alt)
+      6. server.js         (server convention)
+      7. main.js           (alt convention)
+
+    Falls back gracefully if package.json is malformed — never raises.
+    """
+    import json
+    candidates: list[list[str]] = []
+    try:
+        pkg = json.loads((repo_path / "package.json").read_text())
+    except (OSError, ValueError):
+        pkg = {}
+
+    scripts = pkg.get("scripts", {}) or {}
+    if isinstance(scripts, dict) and "start" in scripts:
+        candidates.append(["npm", "start"])
+
+    main = pkg.get("main")
+    if isinstance(main, str) and main:
+        candidates.append(["node", main])
+
+    bin_field = pkg.get("bin")
+    if isinstance(bin_field, str) and bin_field:
+        candidates.append(["node", bin_field])
+    elif isinstance(bin_field, dict) and bin_field:
+        # Pick the first bin entry deterministically (sorted).
+        first = sorted(bin_field.keys())[0]
+        candidates.append(["node", bin_field[first]])
+
+    # Convention fallbacks (only added if the file actually exists).
+    for f in ("index.js", "app.js", "server.js", "main.js"):
+        if (repo_path / f).exists():
+            candidates.append(["node", f])
+
+    # Always try `npm start` last as a final fallback if we haven't
+    # already added it from scripts.start — npm start may work even
+    # without a scripts.start if npm's defaults resolve.
+    if ["npm", "start"] not in candidates:
+        candidates.append(["npm", "start"])
+
+    return candidates
+
+
+def _detect_python_entrypoints(repo_path: Path) -> list[list[str]]:
+    """Pick Python entrypoints by scanning for common boot files.
+
+    Covers:
+      - main.py / app.py at root          (scripts)
+      - server.py / run.py at root        (servers, launchers)
+      - manage.py at root                 (Django — run with `check` to
+                                           verify the project loads)
+      - src/main.py / src/app.py          (src-layout packages)
+      - __main__.py at root or in a top-  (python -m <pkg>)
+        level package dir
+
+    Django's `manage.py` with no args exits non-zero (prints usage), so
+    for manage.py we run `manage.py check` which exits 0 if the Django
+    project is correctly wired. That's the right "does it boot" test
+    for a Django repo.
+    """
+    candidates: list[list[str]] = []
+
+    # Root-level scripts.
+    for f in ("main.py", "app.py", "server.py", "run.py"):
+        if (repo_path / f).exists():
+            candidates.append(["python", f])
+
+    # Django — `manage.py check` verifies the project loads.
+    if (repo_path / "manage.py").exists():
+        candidates.append(["python", "manage.py", "check"])
+
+    # src-layout.
+    for f in ("src/main.py", "src/app.py"):
+        if (repo_path / f).exists():
+            candidates.append(["python", f])
+
+    # python -m <pkg> via __main__.py.
+    if (repo_path / "__main__.py").exists():
+        candidates.append(["python", "__main__.py"])
+    else:
+        # Look for a top-level package (dir with __init__.py) that has
+        # a __main__.py — that's `python -m <pkg>`.
+        for entry in sorted((repo_path).iterdir()):
+            if entry.is_dir() and (entry / "__init__.py").exists() \
+                    and (entry / "__main__.py").exists():
+                candidates.append(["python", "-m", entry.name])
+                break  # one is enough; deterministic via sorted()
+
+    return candidates
+
+
 def detect_stack(repo_path: Path) -> Optional[StackProfile]:
     """
     Detect project stack by checking for marker files in the repo root.
     Returns None if no supported stack is found.
+
+    SECURITY NOTE on install commands:
+      The install phase runs with network ON (it has to, to fetch
+      packages). That creates a supply-chain window: a malicious
+      package.json can declare preinstall/postinstall scripts that
+      execute arbitrary code with network access for up to 60 seconds.
+      We close that window for npm with --ignore-scripts (lifecycle
+      scripts are NOT executed; packages are still fetched and written
+      to node_modules). For pip we use --prefer-binary to push toward
+      wheels (no setup.py / PEP 517 build execution); sdist builds
+      remain a residual risk documented in the README.
     """
     # Node.js
     if (repo_path / "package.json").exists():
         return StackProfile(
             name="Node.js",
             image="node:20-slim",
-            install_cmd=["npm", "install", "--prefix", "/tmp/npm_cache"],
-            run_candidates=[
-                ["node", "index.js"],
-                ["node", "app.js"],
-                ["npm", "start"],
+            # --ignore-scripts: do NOT run preinstall/postinstall/install
+            # lifecycle scripts. They would execute with network ON for
+            # up to 60s — the exact attack vector this tool exists to
+            # catch. Packages are still fetched and unpacked.
+            install_cmd=[
+                "npm", "install", "--ignore-scripts",
+                "--prefix", "/tmp/npm_cache",
             ],
+            run_candidates=_detect_node_entrypoints(repo_path),
             env={"NODE_PATH": "/tmp/npm_cache/node_modules"},
             deps_mount="/tmp/npm_cache",
         )
 
-    # Python — requirements.txt OR main.py
-    if (repo_path / "requirements.txt").exists() or (repo_path / "main.py").exists():
+    # Python — requirements.txt OR pyproject.toml OR setup.py OR any
+    # recognized Python entrypoint file OR a top-level package with
+    # __main__.py (python -m <pkg>).
+    #
+    # pyproject.toml is the dominant Python project format in 2026
+    # (Poetry, Hatch, PDM, uv, modern setuptools). Without it, the tool
+    # would miss the majority of real modern Python repos.
+    py_entry_files = ("main.py", "app.py", "server.py", "run.py",
+                      "manage.py", "__main__.py")
+    has_python_entry = any((repo_path / f).exists() for f in py_entry_files) \
+        or (repo_path / "src/main.py").exists() \
+        or (repo_path / "src/app.py").exists()
+    # Also detect: a top-level package dir (has __init__.py) with __main__.py
+    if not has_python_entry:
+        for entry in sorted(repo_path.iterdir()):
+            if entry.is_dir() and (entry / "__init__.py").exists() \
+                    and (entry / "__main__.py").exists():
+                has_python_entry = True
+                break
+    has_python_marker = (
+        (repo_path / "requirements.txt").exists()
+        or (repo_path / "pyproject.toml").exists()
+        or (repo_path / "setup.py").exists()
+        or has_python_entry
+    )
+    if has_python_marker:
         install_cmd: list[str] = []
         if (repo_path / "requirements.txt").exists():
+            # --prefer-binary: prefer wheels over sdists. Wheels don't
+            # execute setup.py / PEP 517 build backends, so this avoids
+            # most arbitrary-code-during-install risk. sdist-only
+            # packages still trigger a build (residual risk; see README).
             install_cmd = [
-                "pip", "install", "--no-cache-dir",
+                "pip", "install", "--no-cache-dir", "--prefer-binary",
                 "-r", "requirements.txt",
                 "-t", "/tmp/pip_deps",
             ]
-        # NOTE: Spec says PYTHONPATH=/tmp/pip_deps:$PYTHONPATH. The
-        # python:3.11-slim image has no PYTHONPATH set by default, so
-        # "/tmp/pip_deps" alone is equivalent to prepending.
         return StackProfile(
             name="Python",
             image="python:3.11-slim",
             install_cmd=install_cmd,
-            run_candidates=[
-                ["python", "main.py"],
-                ["python", "app.py"],
-            ],
+            run_candidates=_detect_python_entrypoints(repo_path),
             env={
                 "PYTHONPATH": "/tmp/pip_deps",
                 "PYTHONDONTWRITEBYTECODE": "1",
@@ -313,25 +520,31 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
             deps_mount="/tmp/pip_deps" if install_cmd else None,
         )
 
-    # Go
+    # Go — EXPERIMENTAL.
+    # go run main.go under --network none can't fetch modules. Only
+    # repos with a vendor/ directory or zero external deps will boot.
+    # See README Limitations section.
     if (repo_path / "go.mod").exists():
         return StackProfile(
-            name="Go",
+            name="Go (experimental)",
             image="golang:1.22-alpine",
-            install_cmd=[],  # Per spec: no install step for Go
+            install_cmd=[],
             run_candidates=[["go", "run", "main.go"]],
-            env={},
+            env={"GOFLAGS": "-mod=vendor", "GOPATH": "/tmp/go"},
             deps_mount=None,
         )
 
-    # Rust
+    # Rust — EXPERIMENTAL.
+    # cargo run must compile offline under --network none within 30s at
+    # 0.5 CPU. Only tiny zero-dep crates or pre-vendored projects boot.
+    # See README Limitations section.
     if (repo_path / "Cargo.toml").exists():
         return StackProfile(
-            name="Rust",
+            name="Rust (experimental)",
             image="rust:1.75-slim",
-            install_cmd=[],  # Per spec: no install step for Rust
-            run_candidates=[["cargo", "run"]],
-            env={},
+            install_cmd=[],
+            run_candidates=[["cargo", "run", "--offline"]],
+            env={"CARGO_NET_OFFLINE": "true"},
             deps_mount=None,
         )
 
@@ -651,19 +864,89 @@ def execute_entrypoint(
 # ----------------------------------------------------------------------
 
 def analyze_result(result: ExecutionResult) -> Verdict:
-    """Produce a verdict from the execution result. 100% deterministic."""
-    boots = (result.exit_code == 0)
+    """Produce a verdict from the execution result. 100% deterministic.
+
+    BOOTS semantics (readiness-aware, not just exit-code-aware):
+
+      exit 0 (clean exit)            -> BOOTS: YES  ("exited 0")
+      timed out, no crash signature  -> BOOTS: YES  ("long-running process
+                                                    (timed out at Ns,
+                                                     no crash detected)")
+      timed out, crash signature     -> BOOTS: NO   ("crashed before timeout")
+      timed out + readiness signal   -> BOOTS: YES  ("server detected: <signal>")
+      non-zero exit, not timeout     -> BOOTS: NO   ("exited <code> (crash)")
+
+    The previous logic (`boots = exit_code == 0`) marked every server,
+    daemon, and bot as BOOTS: NO because they don't exit on their own.
+    That's a false negative on exactly the repos people most want to
+    triage. A process that stays alive for the full timeout without
+    crashing HAS booted — it's just long-running.
+
+    Readiness signals ("listening on port 8080", "Uvicorn running",
+    "server started", etc.) upgrade a timeout from "long-running" to
+    "server detected" so the user gets more signal.
+    """
     warnings: list[str] = []
-
-    if result.timed_out:
-        warnings.append(f"Execution timed out after {EXEC_TIMEOUT_SEC}s.")
-
     combined = result.stdout + "\n" + result.stderr
-    if NETWORK_ERROR_RE.search(combined):
+    combined_lower = combined.lower()
+
+    # Network-error detection (unchanged — still deterministic regex).
+    network_blocked = bool(NETWORK_ERROR_RE.search(combined))
+    if network_blocked:
         warnings.append(
             "App crashed when network was blocked. "
             "May require external API to function."
         )
+
+    # Readiness-signal detection — only meaningful for long-running procs.
+    readiness_signal: Optional[str] = None
+    for pat in READINESS_SIGNAL_PATTERNS:
+        m = pat.search(combined)
+        if m:
+            readiness_signal = m.group(0).strip()
+            break
+
+    # Crash-signature detection — distinguishes a real crash from a
+    # healthy long-running process that hit the timeout.
+    crashed = any(sig in combined_lower for sig in CRASH_SIGNATURES)
+
+    # ---- Determine boots + detail ----
+    if result.exit_code == 0:
+        boots = True
+        detail = "exited 0"
+    elif result.timed_out:
+        # Timeout: the process didn't exit on its own.
+        if crashed:
+            # It crashed (traceback/panic/etc.) before the timeout fired.
+            boots = False
+            detail = f"crashed before {EXEC_TIMEOUT_SEC}s timeout"
+            warnings.append(
+                f"Process crashed within the {EXEC_TIMEOUT_SEC}s "
+                f"execution window."
+            )
+        elif readiness_signal:
+            # Stayed alive AND printed a readiness line -> strong server YES.
+            boots = True
+            detail = f"server detected: {readiness_signal}"
+        else:
+            # Stayed alive with no crash and no readiness signal.
+            # This is the honest default for daemons/servers/bots.
+            # Could also be a silent infinite loop, but a false positive
+            # ("yes, it ran" for a hung loop) is less damaging than a
+            # false negative ("no" for a real server), because the user
+            # sees the timeout note and can investigate further.
+            boots = True
+            detail = (f"long-running process (timed out at "
+                      f"{EXEC_TIMEOUT_SEC}s, no crash detected)")
+            warnings.append(
+                f"Process did not exit within {EXEC_TIMEOUT_SEC}s. "
+                f"Treated as a healthy long-running process (server/daemon). "
+                f"Use --keep-clone to inspect manually if unsure."
+            )
+    else:
+        # Non-zero exit, not a timeout — genuine crash or arg-error.
+        boots = False
+        detail = f"exited {result.exit_code} (crash)"
 
     return Verdict(
         boots=boots,
@@ -672,6 +955,7 @@ def analyze_result(result: ExecutionResult) -> Verdict:
         stdout_preview=result.stdout[:MAX_STDOUT_CHARS],
         stderr_preview=result.stderr[:MAX_STDERR_CHARS],
         warnings=warnings,
+        detail=detail,
     )
 
 
@@ -820,6 +1104,8 @@ def print_verdict(
     table.add_row("Repository", repo_url)
     table.add_row("Detected Stack", stack_name)
     table.add_row("BOOTS", boots_str)
+    if verdict.detail:
+        table.add_row("Detail", f"[dim]{verdict.detail}[/dim]")
     table.add_row("Network Egress", "[bold red]BLOCKED[/bold red]")
     table.add_row("Filesystem", "[bold yellow]READ-ONLY[/bold yellow]")
     if verdict.warnings:
@@ -970,6 +1256,11 @@ def main(
         check_docker_running()
 
         # ---- Step 1: Clone (depth=1) --------------------------------
+        # Note: errors are captured and printed AFTER the Progress
+        # context exits. Printing inside an active Progress context
+        # causes the spinner line and the error to interleave, which
+        # looks broken to the user.
+        clone_error: Optional[str] = None
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -982,12 +1273,13 @@ def main(
             try:
                 Repo.clone_from(repo_url, repo_dir, depth=1)
             except GitCommandError as e:
-                msg = e.stderr.strip() if e.stderr else str(e)
-                console.print(f"[red]Clone failed: {msg}[/red]")
-                raise typer.Exit(code=2)
+                clone_error = e.stderr.strip() if e.stderr else str(e)
             except Exception as e:
-                console.print(f"[red]Clone failed: {e}[/red]")
-                raise typer.Exit(code=2)
+                clone_error = str(e)
+
+        if clone_error:
+            console.print(f"[red]Clone failed: {clone_error}[/red]")
+            raise typer.Exit(code=2)
 
         # ---- Step 2: Detect stack -----------------------------------
         stack = detect_stack(repo_dir)
@@ -1084,14 +1376,31 @@ def main(
         print_verdict(verdict, repo_url, stack.name, install_result)
         print_behavior_report(behavior_report)
 
-        # If strace caught a sensitive-file access, escalate the exit
-        # code to 1 even if the app exited 0. This is the enterprise
-        # gate: a clean exit doesn't matter if it tried to read ~/.ssh.
-        if behavior_report.sensitive_access and verdict.boots:
-            console.print(
-                "[bold red][!] Escalating verdict to BOOTS: NO — "
-                "sensitive file access detected despite clean exit.[/bold red]"
-            )
+        # ---- Step 6b: Sensitive-access escalation ------------------
+        # Sensitive file access is ALWAYS a hard fail, regardless of
+        # whether the app crashed or exited cleanly. The previous logic
+        # only escalated when boots=True, which meant a crashing repo
+        # that read ~/.ssh/id_rsa would never trigger the escalation —
+        # its sensitive access was buried under a crash verdict.
+        #
+        # Now: if strace caught ANY sensitive-path access, the exit
+        # code is always 1, and the verdict is always NO. If the app
+        # exited cleanly, we explicitly escalate. If it already crashed,
+        # we foreground the sensitive access as the primary indicator.
+        if behavior_report.sensitive_access:
+            if verdict.boots:
+                # Clean exit but touched secrets — escalate.
+                console.print(
+                    "[bold red][!] Escalating verdict to BOOTS: NO — "
+                    "sensitive file access detected despite clean exit.[/bold red]"
+                )
+            else:
+                # Already crashed, but sensitive access is the headline.
+                console.print(
+                    "[bold red][!] Sensitive file access detected — "
+                    "primary indicator of malicious intent. "
+                    f"Paths: {', '.join(behavior_report.sensitive_access)}[/bold red]"
+                )
             raise typer.Exit(code=1)
 
         # Exit code reflects boots status (useful for scripting / CI).

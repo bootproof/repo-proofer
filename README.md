@@ -4,7 +4,7 @@
 
 GitHub is flooded with AI-generated "slop" — repositories that have impressive READMEs but don't actually run, or worse, quietly phone home to a C2 server the moment you `npm install` them. Developers waste 30+ minutes cloning, debugging, and disinfecting these repos.
 
-`repo-proofer` is a consumer-side triage tool. Point it at any public Git URL. In under 5 seconds it clones the repo, drops it into a hardened Docker sandbox with the network disabled and the filesystem read-only, executes the entrypoint, and prints a brutal honest verdict:
+`repo-proofer` is a consumer-side triage tool. Point it at any public Git URL. It clones the repo, drops it into a hardened Docker sandbox with the network disabled and the filesystem read-only, executes the entrypoint, and prints a brutal honest verdict:
 
 ```
 BOOTS: NO. Network Egress: BLOCKED. Filesystem: READ-ONLY.
@@ -27,20 +27,27 @@ If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdi
 
 - **Zero AI.** Pure subprocess + filesystem + strace. Deterministic, fast, free to run forever.
 - **Hardened sandbox.** `--rm --read-only --network none --cap-drop ALL --memory 512m --cpus 0.5 --tmpfs /tmp`. The repo is mounted `:ro`. No exceptions.
-- **Stack auto-detection.** Node.js, Python, Go, Rust — picked by file-existence (`package.json`, `requirements.txt`/`main.py`, `go.mod`, `Cargo.toml`).
+- **Stack auto-detection.** Node.js, Python, Go (experimental), Rust (experimental) — picked by file-existence (`package.json`, `requirements.txt`/`pyproject.toml`/`setup.py`/`main.py`, `go.mod`, `Cargo.toml`).
 - **Runtime Behavior Report.** When enabled (default), the entrypoint is wrapped in `strace -ff` inside the sandbox. After execution you get an SBOM-style report based on *actual execution, not static guessing*:
   - Files Read
   - Files Written
   - Processes Spawned
-  - Network Calls Attempted (with target IP/port, even when blocked)
-  - Sensitive File Access (`~/.ssh/`, `.aws/credentials`, `.env`, `/etc/passwd`, ...)
-- **Graceful fallback.** No Docker? Errors cleanly. No strace image? Falls back to a non-traced run. Install step fails? Proceeds to execution anyway (no auto-repair).
+  - Network Calls Attempted (with target IP:port for hardcoded-IP malware; hostname-based C2 may appear as DNS resolver queries under `--network none`)
+  - Sensitive File Access (`~/.ssh/`, `.aws/credentials`, `.env`, `/etc/passwd`, ...) — the strongest and most unambiguous signal
+- **Graceful fallback.** No Docker? Errors cleanly. No strace image? Falls back to a non-traced run. Install step fails? Proceeds to execution anyway (no auto-repair). Missing Python deps? Prints a guided `pip install` message instead of a traceback.
 
 ---
 
 ## Install
 
 ```bash
+git clone https://github.com/bootproof/repo-proofer.git
+cd repo-proofer
+
+# Create a venv first (avoids 'externally-managed-environment' on macOS/Linux):
+python3 -m venv .venv
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
@@ -50,12 +57,14 @@ Requires:
 
 Supported stacks and their base images:
 
-| Marker file        | Stack    | Image                |
-|--------------------|----------|----------------------|
-| `package.json`     | Node.js  | `node:20-slim`       |
-| `requirements.txt` / `main.py` | Python | `python:3.11-slim` |
-| `go.mod`           | Go       | `golang:1.22-alpine` |
-| `Cargo.toml`       | Rust     | `rust:1.75-slim`     |
+| Marker file                          | Stack                | Image                | Status       |
+|--------------------------------------|----------------------|----------------------|--------------|
+| `package.json`                       | Node.js              | `node:20-slim`       | Supported    |
+| `requirements.txt` / `pyproject.toml` / `setup.py` / `main.py` / `server.py` / `manage.py` | Python | `python:3.11-slim` | Supported |
+| `go.mod`                             | Go                   | `golang:1.22-alpine` | Experimental |
+| `Cargo.toml`                         | Rust                 | `rust:1.75-slim`     | Experimental |
+
+> **Why Go/Rust are experimental:** both run under `--network none` with no install step, so any project with external dependencies can't fetch them at runtime. Only zero-dependency or pre-vendored Go/Rust projects will boot. See [Limitations](#limitations) below.
 
 ---
 
@@ -87,6 +96,40 @@ python proofer.py https://github.com/owner/repo.git --no-behavior-report
 | 5    | Failed to pull Docker image.                         |
 
 The exit code is CI-friendly: wire it into a GitHub Actions workflow and any repo that can't boot offline blocks the PR.
+
+---
+
+## Quick start
+
+```bash
+# Test against the built-in clean fixture (should BOOTS: YES, exit 0)
+python proofer.py file://$(pwd)/tests/fixtures/clean-repo
+
+# Test against the built-in slop fixture (should BOOTS: NO, exit 1)
+python proofer.py file://$(pwd)/tests/fixtures/slop-repo
+```
+
+Or point it at any public GitHub URL:
+
+```bash
+# A well-maintained Python package with requirements.txt
+python proofer.py https://github.com/pallets/markupsafe.git
+
+# A simple Node.js package
+python proofer.py https://github.com/sindresorhus/is-odd.git
+```
+
+> **Note:** repos with `pyproject.toml` + `src/` layouts (like `pallets/click`) are now *detected* but may report `BOOTS: NO` if they're libraries with no runnable entrypoint — that's the honest verdict for a library, not a tool failure.
+
+### Run the full test suite
+
+```bash
+# Deterministic tests (no Docker needed, ~1 second)
+python scripts/smoke_test.py
+
+# Docker integration tests (requires Docker, ~2 minutes first run)
+python tests/integration_test.py
+```
 
 ---
 
@@ -170,7 +213,19 @@ If the app crashes because it can't reach the network, **that is a successful de
 
 ## Why no LLMs?
 
-Speed, reliability, and zero cost. A deterministic engine runs in 4 seconds, costs nothing per invocation, and gives the same answer every time. An LLM-based analyzer would be slower, more expensive, and gameable via prompt injection in the repo's own README. Pure determinism is the core feature.
+Speed, reliability, and zero cost. A deterministic engine runs in seconds (warm cache, fast-exiting scripts), costs nothing per invocation, and gives the same answer every time. An LLM-based analyzer would be slower, more expensive, and gameable via prompt injection in the repo's own README. Pure determinism is the core feature.
+
+---
+
+## Limitations
+
+This tool is honest about what it can and can't do. The gaps below are real; workarounds are noted where they exist.
+
+- **First run is minutes, not seconds.** Before the first execution, repo-proofer must `docker pull` a base image (hundreds of MB) and `docker build` a derived strace image. Subsequent runs are fast (images are cached), but the first run on a fresh machine is a one-time cost.
+- **Go and Rust are experimental.** Both run under `--network none` with no install step, so any project with external dependencies can't fetch them at runtime. Only zero-dependency or pre-vendored Go/Rust projects will boot. A future release may add a `go mod vendor` / `cargo vendor` install phase.
+- **Hostname-based C2 detection is indirect.** Under `--network none`, DNS resolution fails *before* `connect()`, so a hostname-based egress target shows up in the strace report as a DNS query to the resolver (e.g. `connect 192.168.65.7:53`), not as the actual hostname. Hardcoded-IP malware produces the clean `connect <IP>:<port>` line shown in the example above. The **Sensitive File Access** list is the strong, unambiguous signal regardless of how the app phones home.
+- **Install-phase residual risk.** The install phase runs with network ON (it has to, to fetch packages). We close the npm supply-chain window with `--ignore-scripts` (lifecycle scripts are NOT executed), and push pip toward wheels with `--prefer-binary`. However, pip packages that only ship as sdists will still trigger a PEP 517 build backend during install. This is a known residual risk; a future release may run the install phase under `--network none` with a pre-populated package cache.
+- **Docker is required.** This is the heaviest prerequisite for a consumer-triage tool. A future release may add a lighter default sandbox (bubblewrap/nsjail/seccomp) so people without Docker can get the 60-second payoff, with full Docker isolation reserved for `--strict`/enterprise use.
 
 ---
 

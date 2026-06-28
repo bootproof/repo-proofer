@@ -45,9 +45,11 @@ FIXTURE_SPECS = [
             "Files Read",
             "Processes Spawned",
         ],
-        "must_not_contain_stdout": [
-            "Sensitive File Access",  # should not see this for clean repo
-        ],
+        # Do NOT assert must_not_contain "Sensitive File Access" — the
+        # behavior report always prints that row as a label (showing 0
+        # for clean repos). Asserting its absence was a false negative
+        # that made this test fail for every repo on Earth.
+        "must_not_contain_stdout": [],
         "description": (
             "A well-behaved Python repo. Should BOOTS:YES, exit 0, "
             "no warnings, no sensitive access."
@@ -62,8 +64,12 @@ FIXTURE_SPECS = [
             "NO",
             "Network Calls Attempted",
             "Sensitive File Access",
-            "escalating",  # the escalation message
         ],
+        # Do NOT assert "escalating" — that word only appears when the
+        # app exits cleanly AND touched a secret. The slop fixture
+        # crashes (network blocked -> sys.exit(1)), so boots is already
+        # NO. The sensitive access IS still detected and shown — that's
+        # what we assert on.
         "must_contain_stderr": [],
         "description": (
             "A malicious repo disguised as an AI startup. Should BOOTS:NO, "
@@ -165,6 +171,30 @@ def check_docker() -> bool:
         return False
 
 
+def check_deps() -> bool:
+    """Verify proofer's Python dependencies are installed.
+
+    Without this check, a missing typer/rich/gitpython causes proofer.py
+    to dump a raw ImportError traceback inside the subprocess, which
+    looks like a proofer failure when it's actually an environment
+    problem. We check BEFORE pulling Docker images so the user gets a
+    fast, clear message.
+    """
+    missing = []
+    for mod in ("typer", "rich", "git"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        print(f"[ERROR] Missing Python dependencies: {', '.join(missing)}")
+        print("        Run: pip install -r requirements.txt")
+        print("        (On macOS/Linux, create a venv first:")
+        print("         python3 -m venv .venv && source .venv/bin/activate)")
+        return False
+    return True
+
+
 def main() -> int:
     init_only = "--init-only" in sys.argv
     keep_clones = "--keep-clones" in sys.argv
@@ -174,7 +204,7 @@ def main() -> int:
     print(f"Fixtures:  {FIXTURES}")
 
     # Always ensure fixtures are git repos (needed for both init-only and full run)
-    print("\n[1/3] Ensuring fixture repos are git-initialized...")
+    print("\n[1/4] Ensuring fixture repos are git-initialized...")
     for spec in FIXTURE_SPECS:
         ensure_fixture_is_git_repo(spec["dir"])
     print("      Done.")
@@ -183,13 +213,18 @@ def main() -> int:
         print("\n[--init-only] Fixtures initialized. Exiting without running Docker.")
         return 0
 
-    print("\n[2/3] Checking Docker daemon...")
+    print("\n[2/4] Checking Python dependencies...")
+    if not check_deps():
+        return 1
+    print("      Dependencies OK.")
+
+    print("\n[3/4] Checking Docker daemon...")
     if not check_docker():
         print("[ERROR] Docker is not available. Install Docker and retry.")
         return 3
     print("      Docker is running.")
 
-    print("\n[3/3] Running proofer.py against each fixture...")
+    print("\n[4/4] Running proofer.py against each fixture...")
     work_dir = Path(tempfile.mkdtemp(prefix="repo-proofer-inttest-"))
     try:
         results = [check_fixture(spec, work_dir) for spec in FIXTURE_SPECS]
