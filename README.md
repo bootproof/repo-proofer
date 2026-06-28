@@ -1,179 +1,26 @@
 # repo-proofer
 
-**Brutally honest verdicts for AI-generated GitHub repos. 100% deterministic. No LLMs.**
+[![CI](https://github.com/bootproof/repo-proofer/actions/workflows/ci.yml/badge.svg)](https://github.com/bootproof/repo-proofer/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI](https://img.shields.io/pypi/v/repo-proofer.svg)](https://pypi.org/project/repo-proofer/)
 
-GitHub is flooded with AI-generated "slop" — repositories that have impressive READMEs but don't actually run, or worse, quietly phone home to a C2 server the moment you `npm install` them. Developers waste 30+ minutes cloning, debugging, and disinfecting these repos.
+Find out if a repo will steal your keys before you run it.
 
-`repo-proofer` is a consumer-side triage tool. Point it at any public Git URL. It clones the repo, drops it into a hardened Docker sandbox with the network disabled and the filesystem read-only, executes the entrypoint, and prints a brutal honest verdict:
+GitHub is flooded with AI-generated "slop" — repositories with impressive READMEs that don't actually run, or worse, quietly phone home to a C2 server the moment you `npm install` them. `repo-proofer` clones a repo, drops it into a zero-network, read-only sandbox, executes it, and tells you — deterministically, no AI — whether it booted and whether it tried to read your SSH keys.
 
-```
-BOOTS: NO. Network Egress: BLOCKED. Filesystem: READ-ONLY.
-[!] App crashed when network was blocked. May require external API to function.
-```
-
-If a repo can't boot without internet, that's not a tool failure — that's a successful detection of a hidden dependency. **You cannot bypass physics.**
-
----
-
-## The Solution
-
-`--network none` and `--read-only` are mandatory on every execution. Static analysis (Snyk, Socket, GitHub Advanced Security) reads code to see if it *looks* malicious. `repo-proofer` actually runs it in a locked box and watches what it *does*. Obfuscation can fool a linter. It cannot fool a kernel that refuses to open a socket.
-
-If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdict escalates to `BOOTS: NO` even if the process exited cleanly. 
-
----
-
-## Features
-
-- **Zero AI.** Pure subprocess + filesystem + strace. Deterministic, fast, free to run forever.
-- **Hardened sandbox.** `--rm --read-only --network none --cap-drop ALL --memory 512m --cpus 0.5 --tmpfs /tmp` (Docker mode) or `--unshare-net --ro-bind --tmpfs /home --tmpfs /root` (native bubblewrap mode). The repo is always mounted `:ro`. No exceptions.
-- **Stack auto-detection.** Node.js, Python, Go (experimental), Rust (experimental) — picked by file-existence (`package.json`, `requirements.txt`/`pyproject.toml`/`setup.py`/`setup.cfg`/`main.py`, `go.mod`, `Cargo.toml`). Python entrypoints are resolved from `[project.scripts]` / `console_scripts` (modern CLI apps), `manage.py`, `src/` layouts, `__main__.py`, and conventional files — so a real Typer/Click CLI that declares its entrypoint only in `pyproject.toml` is correctly detected as runnable, not mislabeled as a library.
-- **Runtime Behavior Report.** When enabled (default), the entrypoint is wrapped in `strace -ff` inside the sandbox. After execution you get an SBOM-style report based on *actual execution, not static guessing*:
-  - Files Read
-  - Files Written
-  - Processes Spawned
-  - Network Calls Attempted (with target IP:port for hardcoded-IP malware; hostname-based C2 may appear as DNS resolver queries under `--network none`)
-  - Sensitive File Access (`~/.ssh/`, `.aws/credentials`, `.env`, `/etc/passwd`, ...) — the strongest and most unambiguous signal
-- **Graceful fallback.** No Docker? Errors cleanly. No strace image? Falls back to a non-traced run. Install step fails? Proceeds to execution anyway (no auto-repair). Missing Python deps? Prints a guided `pip install` message instead of a traceback.
-
----
-
-## Install
-
-### Option 1: One-command install (recommended)
-
-Once published to PyPI:
-
-```bash
-# Using uv (fastest — no install needed, runs from cache):
-uvx repo-proofer https://github.com/owner/repo.git
-
-# Or install permanently with pipx:
-pipx install repo-proofer
-repo-proofer https://github.com/owner/repo.git
-
-# Or with uv tool install:
-uv tool install repo-proofer
-repo-proofer https://github.com/owner/repo.git
-```
-
-### Option 2: From source (for development)
-
-```bash
-git clone https://github.com/bootproof/repo-proofer.git
-cd repo-proofer
-
-# Create a venv first (avoids 'externally-managed-environment' on macOS/Linux):
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install -e .          # installs proofer.py + deps + `repo-proofer` command
-# or just:
-pip install -r requirements.txt
-```
-
-Requires:
-- Python 3.10+
-- Docker (running locally)
-
-Supported stacks and their base images:
-
-| Marker file                          | Stack                | Image                | Status       |
-|--------------------------------------|----------------------|----------------------|--------------|
-| `package.json`                       | Node.js              | `node:20-slim`       | Supported    |
-| `requirements.txt` / `pyproject.toml` / `setup.py` / `setup.cfg` / `main.py` / `server.py` / `manage.py` / `[project.scripts]` | Python | `python:3.11-slim` | Supported |
-| `go.mod`                             | Go                   | `golang:1.22-alpine` | Experimental |
-| `Cargo.toml`                         | Rust                 | `rust:1.75-slim`     | Experimental |
-
-> **Why Go/Rust are experimental:** both run under `--network none` with no install step, so any project with external dependencies can't fetch them at runtime. Only zero-dependency or pre-vendored Go/Rust projects will boot. See [Limitations](#limitations) below.
-
----
-
-## Usage
-
-```bash
-python proofer.py https://github.com/owner/repo.git
-python proofer.py https://github.com/owner/repo.git --keep-clone
-python proofer.py https://github.com/owner/repo.git --no-behavior-report
-```
-
-### Options
-
-| Flag                     | Description                                                                       |
-|--------------------------|-----------------------------------------------------------------------------------|
-| `--keep-clone`           | Keep the cloned repo, deps cache, and strace trace on disk for debugging.         |
-| `--no-behavior-report`   | Skip strace wrapping. Faster, but no file/process/network tracking.               |
-| `--help`                 | Show help.                                                                        |
-
-### Exit codes
-
-| Code | Meaning                                              |
-|------|------------------------------------------------------|
-| 0    | Repo boots cleanly, OR is a library (no entrypoint).|
-| 1    | Repo does NOT boot (non-zero exit, sensitive access).|
-| 2    | Clone failed.                                        |
-| 3    | Docker not installed / daemon not running.           |
-| 4    | Could not detect project stack.                      |
-| 5    | Failed to pull Docker image.                         |
-
-> **Note on exit code 0 for libraries:** A repo detected as a known stack but with no runnable entrypoint (e.g. `click`, `markupsafe` — a library, not an app) exits 0 with a yellow `NO RUNNABLE ENTRYPOINT` verdict. This is NOT the same red as a crashed/slop repo. Libraries are not slop; they just have nothing to run. CI pipelines won't block on library repos.
-
-The exit code is CI-friendly: wire it into a GitHub Actions workflow and any repo that crashes or attempts sensitive access blocks the PR.
-
----
-
-## Quick start
-
-```bash
-# Test against the built-in clean fixture (should BOOTS: YES, exit 0)
-python proofer.py file://$(pwd)/tests/fixtures/clean-repo
-
-# Test against the built-in slop fixture (should BOOTS: NO, exit 1)
-python proofer.py file://$(pwd)/tests/fixtures/slop-repo
-```
-
-Or point it at any public GitHub URL:
-
-```bash
-# A Python library — will return NO RUNNABLE ENTRYPOINT (yellow, exit 0).
-# This is the correct verdict for a library: it's not slop, just nothing to run.
-python proofer.py https://github.com/pallets/markupsafe.git
-
-# Or use the installed command:
-repo-proofer https://github.com/pallets/markupsafe.git
-```
-
-> **Three-color verdict system:**
-> - **GREEN `BOOTS: YES`** — the repo ran successfully (clean exit, long-running server, or readiness signal detected).
-> - **RED `BOOTS: NO`** — the repo crashed or attempted sensitive file access. This is the slop signal.
-> - **YELLOW `NO RUNNABLE ENTRYPOINT`** — the repo was detected as a known stack but has nothing to run (a library). Not slop, just not runnable. Exits 0 so CI doesn't block.
-
-### Run the full test suite
-
-```bash
-# Deterministic tests (no Docker needed, ~1 second)
-python scripts/smoke_test.py
-
-# Docker integration tests (requires Docker, ~2 minutes first run)
-python tests/integration_test.py
-```
-
----
-
-## Example output
+<p align="center">
+<i>The slop-repo fixture being caught red-handed.</i>
+</p>
 
 ```
-Checking Docker daemon...
-Cloning https://github.com/owner/repo.git (depth=1)...
-Detected stack: Python (image: python:3.11-slim)
-Building strace-enabled image (one-time setup for python:3.11-slim)...
-Installing dependencies (network ON, timeout 60s)...
-Executing entrypoint (network OFF, read-only FS, timeout 30s)...
+$ repo-proofer file://$(pwd)/tests/fixtures/slop-repo
 
 ╭─ repo-proofer verdict ──────────────────────────────╮
-│ Repository          https://github.com/owner/repo.git│
+│ Repository          file://.../slop-repo             │
 │ Detected Stack      Python                            │
 │ BOOTS               NO                                │
+│ Detail              exited 1 (crash)                  │
 │ Network Egress      BLOCKED                           │
 │ Filesystem          READ-ONLY                         │
 │ Warnings            [!] App crashed when network was  │
@@ -181,95 +28,225 @@ Executing entrypoint (network OFF, read-only FS, timeout 30s)...
 │                     to function.                      │
 ╰──────────────────────────────────────────────────────╯
 
-╭─ Runtime Behavior Report ────────────────────────────╮
-│ Files Read              3                             │
-│ Files Written           2                             │
-│ Processes Spawned       1                             │
-│ Network Calls Attempted 1                             │
-│ Sensitive File Access   1 (see below)                 │
-│                                                       │
-│ Generated via strace inside the zero-network sandbox  │
-╰──────────────────────────────────────────────────────╯
-
-╭─ Network Calls Attempted (1) ────────────────────────╮
-│ - connect 93.184.216.34:443                          │
-╰──────────────────────────────────────────────────────╯
-
-╭─ Sensitive File Access (1) ──────────────────────────╮
+╭─ Sensitive File Access (3) ──────────────────────────╮
+│ - /etc/passwd                                        │
+│ - /root/.ssh/id_ed25519                              │
 │ - /root/.ssh/id_rsa                                  │
 ╰──────────────────────────────────────────────────────╯
 
-[!] Escalating verdict to BOOTS: NO — sensitive file access detected despite clean exit.
+[!] Sensitive file access detected — primary indicator of malicious intent.
 ```
 
----
+## Highlights
+
+- **Runs untrusted code safely.** Every execution is sandboxed with the network disabled and the filesystem read-only. The repo can't phone home. It can't write outside `/tmp`. It can't read `~/.ssh`.
+- **Catches what static analysis can't.** Snyk, Socket, and GitHub Advanced Security read code to see if it *looks* malicious. `repo-proofer` runs it and watches what it *does*. Obfuscation can fool a linter. It cannot fool a kernel that refuses to open a socket.
+- **100% deterministic, zero AI.** Pure subprocess + filesystem + strace. No LLMs, no API calls, no prompt-injection surface. Same answer every time, free to run forever.
+- **No Docker required.** The default `--sandbox auto` uses a native bubblewrap sandbox on Linux — millisecond startup, no image pulls. Docker is the fallback for macOS/Windows or `--sandbox docker` for full clean-room isolation.
+- **Three-color verdicts.** Green `BOOTS: YES` (it ran), red `BOOTS: NO` (it crashed or tried to steal secrets), yellow `NO RUNNABLE ENTRYPOINT` (it's a library, not slop). Libraries don't get the same red as malware.
+- **Runtime Behavior Report.** strace traces every syscall inside the sandbox. You get an SBOM-style report based on *actual execution*: files read, files written, processes spawned, network calls attempted, sensitive paths touched.
+- **Installable in one command.** `uvx repo-proofer <url>` — no clone, no venv, no setup.
+
+## Installation
+
+Install `repo-proofer` from [PyPI](https://pypi.org/project/repo-proofer/):
+
+```bash
+# With uv (no install needed — runs from cache):
+uvx repo-proofer https://github.com/owner/repo.git
+```
+
+```bash
+# Or with pipx:
+pipx install repo-proofer
+repo-proofer https://github.com/owner/repo.git
+```
+
+```bash
+# Or with pip:
+pip install repo-proofer
+```
+
+From source:
+
+```bash
+git clone https://github.com/bootproof/repo-proofer.git
+cd repo-proofer
+pip install -e .
+```
+
+Requires Python 3.10+. The native sandbox (default on Linux) needs `bubblewrap` — install it with `apt install bubblewrap` (Debian/Ubuntu) or `dnf install bubblewrap` (Fedora). No Docker needed.
+
+## Documentation
+
+See the [Limitations](#limitations) section for honest gaps, and the [FAQ](#faq) for common questions. The command-line reference is available with `repo-proofer --help`.
+
+## Features
+
+### Triage a repo
+
+Point `repo-proofer` at any Git URL. It clones, detects the stack, installs deps, executes the entrypoint in a locked sandbox, and prints a verdict.
+
+```console
+$ repo-proofer https://github.com/pallets/markupsafe.git
+Cloning https://github.com/pallets/markupsafe.git (depth=1)...
+Detected stack: Python | Native sandbox (bubblewrap)
+Installing dependencies (network ON, timeout 60s)...
+Executing entrypoint (network OFF, read-only FS, timeout 30s)...
+
+╭─ repo-proofer verdict ──────────────────────────────╮
+│ Repository          https://github.com/pallets/mar…  │
+│ Detected Stack      Python                            │
+│ BOOTS               NO RUNNABLE ENTRYPOINT            │
+│ Detail              no runnable entrypoint            │
+│                     (looks like a library)            │
+│ Network Egress      BLOCKED                           │
+│ Filesystem          READ-ONLY                         │
+╰──────────────────────────────────────────────────────╯
+```
+
+`markupsafe` is a library — no `main.py`, nothing to run. The yellow verdict is correct: it's not slop, it just has no entrypoint. CI exits 0.
+
+### Catch a malicious repo
+
+The `slop-repo` fixture impersonates an AI startup while quietly reading `~/.ssh/id_rsa` and `/etc/passwd`, then phoning home to a C2 server. Under `repo-proofer`'s `--network none` sandbox, the phone-home fails and strace catches the secret reads:
+
+```console
+$ repo-proofer file://$(pwd)/tests/fixtures/slop-repo
+
+╭─ repo-proofer verdict ──────────────────────────────╮
+│ BOOTS               NO                                │
+│ Detail              exited 1 (crash)                  │
+│ Warnings            [!] App crashed when network was  │
+│                     blocked.                          │
+╰──────────────────────────────────────────────────────╯
+
+╭─ Runtime Behavior Report ────────────────────────────╮
+│ Files Read              2                             │
+│ Network Calls Attempted 1                             │
+│ Sensitive File Access   3 (see below)                 │
+╰──────────────────────────────────────────────────────╯
+
+╭─ Network Calls Attempted (1) ────────────────────────╮
+│ - connect 203.0.113.42:443                           │
+╰──────────────────────────────────────────────────────╯
+
+╭─ Sensitive File Access (3) ──────────────────────────╮
+│ - /etc/passwd                                        │
+│ - /root/.ssh/id_ed25519                              │
+│ - /root/.ssh/id_rsa                                  │
+╰──────────────────────────────────────────────────────╯
+
+[!] Sensitive file access detected — primary indicator of malicious intent.
+```
+
+Exit code 1. The verdict is unambiguous: this repo tried to steal your keys.
+
+### The sandbox
+
+Two backends, same moat:
+
+```console
+$ repo-proofer <url> --sandbox native    # bubblewrap (Linux, no Docker, milliseconds)
+$ repo-proofer <url> --sandbox docker    # Docker (clean-room images, memory/CPU limits)
+$ repo-proofer <url> --sandbox auto      # default: prefer native, fall back to Docker
+```
+
+Both backends enforce the same security constraints:
+
+| Constraint | Docker mode | Native mode |
+|---|---|---|
+| Network | `--network none` | `--unshare-net` |
+| Filesystem | `--read-only` + `--tmpfs /tmp` | `--ro-bind /usr` + `--tmpfs /tmp` |
+| SSH keys | not mounted | `--tmpfs /home` + `--tmpfs /root` (empty) |
+| Capabilities | `--cap-drop ALL` | bubblewrap drops all by default |
+| Repo | `-v repo:/app:ro` | `--ro-bind repo /app` |
+
+If the app crashes because it can't reach the network, **that is a successful detection of a hidden dependency, not a tool failure.**
+
+### Stack detection
+
+`repo-proofer` detects the stack from marker files and resolves the entrypoint:
+
+```console
+$ repo-proofer https://github.com/owner/my-cli.git
+Detected stack: Python | Native sandbox (bubblewrap)
+Executing entrypoint (network OFF, read-only FS, timeout 30s)...
+```
+
+| Marker | Stack | Entrypoint resolution |
+|---|---|---|
+| `package.json` | Node.js | `scripts.start`, `main`, `bin`, then `index.js`/`app.js`/`server.js` |
+| `requirements.txt` / `pyproject.toml` / `setup.py` / `setup.cfg` | Python | `[project.scripts]`, `console_scripts`, `main.py`/`app.py`/`server.py`/`run.py`, `manage.py check`, `src/` layout, `python -m <pkg>` |
+| `go.mod` | Go (experimental) | `go run main.go` |
+| `Cargo.toml` | Rust (experimental) | `cargo run --offline` |
+
+A modern CLI that declares its entrypoint only in `[project.scripts]` (no `main.py`) is correctly detected as runnable — not mislabeled as a library.
+
+### Exit codes
+
+```console
+$ repo-proofer <url>; echo "exit: $?"
+exit: 0    # boots cleanly, OR is a library (yellow)
+exit: 1    # crashed, or attempted sensitive file access (red)
+exit: 2    # clone failed
+exit: 3    # sandbox unavailable (no Docker / no bubblewrap)
+exit: 4    # could not detect project stack
+exit: 5    # failed to pull Docker image
+```
+
+The exit code is CI-friendly: wire it into a GitHub Actions workflow and any repo that crashes or touches secrets blocks the PR.
 
 ## How it works
 
 ```
-1. Clone         git clone --depth=1                          (network ON)
-2. Detect        filesystem checks for marker files           (deterministic)
-3. Install       docker run ... <install_cmd>                 (network ON, 60s)
-4. Execute       docker run --rm --read-only --network none   (network OFF)
-                          --cap-drop ALL --memory 512m --cpus 0.5
-                          --tmpfs /tmp -v repo:/app:ro
-                          --entrypoint /usr/bin/strace        (when behavior report on)
-                          -ff -e trace=openat,open,creat,execve,connect,socket,...
-5. Analyze       regex on stdout/stderr + strace trace files  (deterministic)
-6. Verdict       rich panel + exit code
+1. Clone      git clone --depth=1                          (network ON)
+2. Detect     filesystem checks for marker files           (deterministic)
+3. Install    sandbox ... <install_cmd>                    (network ON, 60s)
+4. Execute    sandbox --network=none --read-only ...       (network OFF)
+              └─ strace -ff -e trace=openat,connect,...    (behavior report)
+5. Analyze    regex on stdout/stderr + strace trace        (deterministic)
+6. Verdict    three-color panel + exit code
 ```
 
-### Security constraints (do not weaken)
-
-The execution phase **always** includes every one of these flags. Removing any of them breaks the moat:
-
-| Flag                  | Why                                                        |
-|-----------------------|------------------------------------------------------------|
-| `--rm`                | Container is removed after run.                            |
-| `--read-only`         | Root filesystem is read-only.                              |
-| `--network none`      | Absolutely no internet access.                             |
-| `--cap-drop ALL`      | No Linux capabilities (SYS_PTRACE added only for strace). |
-| `--memory 512m`       | Memory cap.                                                |
-| `--cpus 0.5`          | CPU cap.                                                   |
-| `--tmpfs /tmp`        | Writable in-memory `/tmp`.                                 |
-| `-v repo:/app:ro`     | Repo mounted **read-only**.                                |
-
-If the app crashes because it can't reach the network, **that is a successful detection of a hidden dependency, not a tool failure.**
-
----
-
-## Why no LLMs?
-
-Speed, reliability, and zero cost. A deterministic engine runs in seconds (warm cache, fast-exiting scripts), costs nothing per invocation, and gives the same answer every time. An LLM-based analyzer would be slower, more expensive, and gameable via prompt injection in the repo's own README. Pure determinism is the core feature.
-
----
+No LLMs. No AI APIs. Pure subprocess + filesystem + strace. An LLM-based analyzer would be slower, more expensive, and gameable via prompt injection in the repo's own README. Pure determinism is the core feature.
 
 ## Limitations
 
-This tool is honest about what it can and can't do. The gaps below are real; workarounds are noted where they exist.
+This tool is honest about what it can and can't do.
 
-- **First run is minutes, not seconds — in Docker mode.** The Docker backend pulls base images (hundreds of MB) and builds a strace image. The native backend (bubblewrap, default on Linux) has no image pulls — it uses the host's runtimes directly and starts in milliseconds.
-- **Go and Rust are experimental.** Both run under `--network none` with no install step, so any project with external dependencies can't fetch them at runtime. Only zero-dependency or pre-vendored Go/Rust projects will boot. A future release may add a `go mod vendor` / `cargo vendor` install phase.
-- **Hostname-based C2 detection is indirect.** Under `--network none`, DNS resolution fails *before* `connect()`, so a hostname-based egress target shows up in the strace report as a DNS query to the resolver (e.g. `connect 192.168.65.7:53`), not as the actual hostname. Hardcoded-IP malware produces the clean `connect <IP>:<port>` line shown in the example above. The **Sensitive File Access** list is the strong, unambiguous signal regardless of how the app phones home.
-- **Install-phase residual risk.** The install phase runs with network ON (it has to, to fetch packages). We close the npm supply-chain window with `--ignore-scripts` (lifecycle scripts are NOT executed), and push pip toward wheels with `--prefer-binary`. However, pip packages that only ship as sdists will still trigger a PEP 517 build backend during install. This is a known residual risk; a future release may run the install phase under `--network none` with a pre-populated package cache.
-- **Native sandbox is Linux-only.** Bubblewrap doesn't exist on macOS/Windows. On those platforms, `--sandbox auto` falls back to Docker. The native sandbox also has no memory/CPU limits (bubblewrap has no built-in cgroup controls) — the network + filesystem moat is fully intact, but a resource-exhaustion DoS isn't prevented. Use `--sandbox docker` for the full isolation profile.
-- **Docker is now optional.** The default `--sandbox auto` prefers the native bubblewrap sandbox (no Docker, no image pulls, millisecond startup). Docker is used as a fallback when bubblewrap isn't available (macOS/Windows) or when explicitly requested via `--sandbox docker`.
+- **First run is minutes in Docker mode.** The Docker backend pulls base images and builds a strace image. The native backend (default on Linux) has no image pulls — it uses the host's runtimes and starts in milliseconds.
+- **Go and Rust are experimental.** Both run under `--network none` with no install step, so projects with external dependencies can't fetch them at runtime. Only zero-dependency or pre-vendored Go/Rust projects boot.
+- **Hostname-based C2 detection is indirect.** Under `--network none`, DNS resolution fails *before* `connect()`, so a hostname-based egress target shows up as a DNS query to the resolver, not the actual hostname. Hardcoded-IP malware produces a clean `connect <IP>:<port>` line. The **Sensitive File Access** list is the strong, unambiguous signal regardless.
+- **Install-phase residual risk.** The install phase runs with network ON (it has to, to fetch packages). npm's supply-chain window is closed with `--ignore-scripts`; pip is pushed toward wheels with `--prefer-binary`. sdist-only packages still trigger a PEP 517 build — a known residual risk.
+- **Native sandbox is Linux-only.** Bubblewrap doesn't exist on macOS/Windows. On those platforms, `--sandbox auto` falls back to Docker. The native sandbox also has no memory/CPU limits — use `--sandbox docker` for the full isolation profile.
 
----
+## FAQ
 
-## Roadmap
+#### Why not just read the code myself?
 
-- [x] Phase 1: Open-source CLI (this repo)
-- [x] `uvx` / `pipx` packaging (`pyproject.toml` + console script)
-- [x] Three-color verdict system (green/red/yellow — libraries are not slop)
-- [x] Console-script entrypoint detection (`[project.scripts]` / `console_scripts`)
-- [x] Docker-optional native sandbox (bubblewrap — `--sandbox auto/native/docker`)
-- [ ] Publish to PyPI (see [PUBLISH.md](PUBLISH.md) — package builds, publish is one command)
-- [ ] Phase 2: Cloud API + runtime-behavior database
-- [ ] Phase 3: Enterprise CI/CD gate (GitHub Actions / GitLab CI plugin)
+You can — and you should, for repos you trust. But for the 95% case ("a stranger's repo with a flashy README"), reading every line of `setup.py` and `postinstall.sh` takes longer than running `repo-proofer`, and obfuscation can hide intent from a human reader. `repo-proofer` watches physics: if the app opens a socket, the kernel tells us. You can't obfuscate a syscall.
 
----
+#### How is this different from Snyk / Socket / GitHub Advanced Security?
+
+Those tools do *static analysis* — they read code to see if it looks malicious. `repo-proofer` does *dynamic execution* — it runs the code in a locked box and watches what it actually does. Static analysis is bypassable (obfuscated code, environment-triggered payloads). Dynamic execution is not: if a malicious repo needs to phone home to download its payload, it physically cannot do that inside `--network none`.
+
+#### What does "BOOTS: YES" mean for a server that never exits?
+
+A process that times out without crashing is a healthy long-running process (server, daemon, bot). The verdict is `BOOTS: YES (long-running)`. If it also printed a readiness signal (`"listening on port 8080"`, `"Uvicorn running"`), the verdict upgrades to `BOOTS: YES (server detected)` with the matched signal shown.
+
+#### Can it run on macOS?
+
+Yes, with Docker. `--sandbox auto` falls back to Docker on macOS (bubblewrap is Linux-only). `uvx repo-proofer <url>` works — it just needs Docker Desktop running.
+
+#### Is it ready for production?
+
+The engine is stable and the deterministic test suite (56 tests) passes on every commit. The native bubblewrap sandbox is new and should be considered beta — the Docker sandbox is the production-grade path. See the [CI badge](https://github.com/bootproof/repo-proofer/actions) for current status.
+
+## Contributing
+
+Contributions are welcome. See the [test suite](scripts/smoke_test.py) for the deterministic core, and [tests/integration_test.py](tests/integration_test.py) for the Docker integration tests. Run `python scripts/smoke_test.py` to verify before submitting a PR.
 
 ## License
 
-MIT
+[MIT](LICENSE)
