@@ -466,6 +466,43 @@ def test_detect_unknown():
     print("[OK] detect_stack: unknown -> None")
 
 
+def test_detect_rails_priority_over_node():
+    """A polyglot repo with BOTH Gemfile+config.ru AND package.json is a
+    Rails app with frontend assets (GitLab, Discourse, Mastodon). The
+    Ruby app is primary; package.json is secondary. Without priority
+    detection, repo-proofer would pick Node.js, run `npm start`, and
+    report 'Missing script: start' as a crash — missing the actual app.
+    """
+    repo = _make_repo({
+        "Gemfile": 'source "https://rubygems.org"\ngem "rails"',
+        "config.ru": 'require "./config/environment"\nrun Rails.application',
+        "package.json": '{"name":"frontend","scripts":{"build":"webpack"}}',
+        "app/controllers/application_controller.rb": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Ruby (Rails)", \
+        f"Expected Ruby (Rails) for polyglot repo, got {s.name}"
+    assert s.image == "ruby:3.3-slim"
+    assert ["bundle", "exec", "rails", "server", "-b", "0.0.0.0"] in s.run_candidates
+    print("[OK] detect_stack: Rails wins over Node.js for polyglot repos (GitLab fix)")
+
+
+def test_detect_python_priority_over_node():
+    """A polyglot repo with BOTH manage.py AND package.json is a Django
+    app with frontend assets. Python is primary."""
+    repo = _make_repo({
+        "manage.py": "#!/usr/bin/env python",
+        "requirements.txt": "django==5.0",
+        "package.json": '{"name":"frontend","scripts":{"build":"webpack"}}',
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python", \
+        f"Expected Python for polyglot repo, got {s.name}"
+    print("[OK] detect_stack: Python wins over Node.js for polyglot repos")
+
+
 def test_detect_node_workspaces():
     """Detect npm workspaces (monorepo) in package.json."""
     from proofer import _detect_node_workspaces
@@ -1053,17 +1090,26 @@ def test_parse_ipv6_attempt():
     print("[OK] parse_strace_output: IPv6 connect captured with bracketed addr")
 
 
-def test_parse_unix_socket_recorded():
+def test_parse_unix_socket_filtered():
+    """AF_UNIX connects are local sockets (nscd, Docker daemon, etc) —
+    NOT network egress. They must be filtered OUT of network_attempts
+    so the count reflects real outbound attempts only. (The GitLab
+    over-counting fix: 'connect unix:/var/run/nscd/socket' was inflating
+    the network count.)"""
     d = Path(tempfile.mkdtemp(prefix="trace-unix-"))
     _write_trace(d, "trace.600", [
         'execve("/usr/local/bin/python3", ["python3", "main.py"], ...) = 0',
         'connect(5, {sa_family=AF_UNIX, sun_path="/var/run/docker.sock"}, 110) = -1 ENOENT',
+        'connect(6, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT',
         '+++ exited with 0 +++',
     ])
     r = parse_strace_output(d)
-    assert any("unix:/var/run/docker.sock" in n for n in r.network_attempts), \
-        f"Expected unix socket entry, got {r.network_attempts}"
-    print("[OK] parse_strace_output: AF_UNIX connect recorded")
+    # AF_UNIX connects must NOT appear in network_attempts
+    assert not any("unix:" in n for n in r.network_attempts), \
+        f"AF_UNIX must be filtered from network_attempts, got {r.network_attempts}"
+    assert len(r.network_attempts) == 0, \
+        f"Expected 0 network attempts (only AF_UNIX), got {r.network_attempts}"
+    print("[OK] parse_strace_output: AF_UNIX connects filtered (not network egress)")
 
 
 def test_parse_no_duplicate_from_bare_trace_file():
@@ -1341,6 +1387,8 @@ def run_all():
     test_detect_go()
     test_detect_rust()
     test_detect_unknown()
+    test_detect_rails_priority_over_node()
+    test_detect_python_priority_over_node()
     test_detect_node_workspaces()
 
     print()
@@ -1392,7 +1440,7 @@ def run_all():
     test_parse_blocked_writes_not_counted_as_written()
     test_parse_malformed_lines_ignored()
     test_parse_ipv6_attempt()
-    test_parse_unix_socket_recorded()
+    test_parse_unix_socket_filtered()
     test_parse_no_duplicate_from_bare_trace_file()
     test_parse_bare_trace_fallback()
     test_behavior_report_has_data_property()

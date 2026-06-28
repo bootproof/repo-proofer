@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -701,6 +701,17 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
     Detect project stack by checking for marker files in the repo root.
     Returns None if no supported stack is found.
 
+    DETECTION PRIORITY (matters for polyglot repos):
+      Many real-world repos are polyglot — a Rails app with a package.json
+      for frontend assets (GitLab), a Django app with a package.json for
+      webpack, etc. The primary app language must win over a secondary
+      package.json. We check in priority order:
+        1. Rails (Gemfile + config.ru) — Ruby, the actual app
+        2. Python (requirements.txt/pyproject.toml/setup.py/manage.py/etc)
+        3. Node.js (package.json) — often just frontend assets
+        4. Go (go.mod)
+        5. Rust (Cargo.toml)
+
     SECURITY NOTE on install commands:
       The install phase runs with network ON (it has to, to fetch
       packages). That creates a supply-chain window: a malicious
@@ -712,38 +723,36 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
       wheels (no setup.py / PEP 517 build execution); sdist builds
       remain a residual risk documented in the README.
     """
-    # Node.js
-    if (repo_path / "package.json").exists():
+    # ---- Rails (Ruby) — check BEFORE Node.js ----
+    # A repo with both Gemfile+config.ru AND package.json is a Rails app
+    # with frontend assets (GitLab, GitLab, Discourse, Mastodon, etc).
+    # The Ruby app is the primary; package.json is secondary. Without
+    # this priority check, repo-proofer would detect Node.js, run
+    # `npm start`, and report "Missing script: start" as a crash —
+    # missing the actual Ruby app entirely.
+    if (repo_path / "Gemfile").exists() and (repo_path / "config.ru").exists():
         return StackProfile(
-            name="Node.js",
-            image="node:20-slim",
-            # --ignore-scripts: do NOT run preinstall/postinstall/install
-            # lifecycle scripts. They would execute with network ON for
-            # up to 60s — the exact attack vector this tool exists to
-            # catch. Packages are still fetched and unpacked.
-            install_cmd=[
-                "npm", "install", "--ignore-scripts",
-                "--prefix", "/tmp/npm_cache",
+            name="Ruby (Rails)",
+            image="ruby:3.3-slim",
+            install_cmd=["bundle", "install", "--path", "/tmp/bundle"],
+            run_candidates=[
+                # Try the Rails server entrypoint.
+                ["bundle", "exec", "rails", "server", "-b", "0.0.0.0"],
+                # Fall back to rackup if rails command isn't available.
+                ["bundle", "exec", "rackup", "--host", "0.0.0.0"],
             ],
-            run_candidates=_detect_node_entrypoints(repo_path),
-            env={"NODE_PATH": "/tmp/npm_cache/node_modules"},
-            deps_mount="/tmp/npm_cache",
+            env={"BUNDLE_GEMFILE": "/app/Gemfile"},
+            deps_mount="/tmp/bundle",
         )
 
-    # Python — requirements.txt OR pyproject.toml OR setup.py OR any
-    # recognized Python entrypoint file OR a top-level package with
-    # __main__.py (python -m <pkg>).
-    #
-    # pyproject.toml is the dominant Python project format in 2026
-    # (Poetry, Hatch, PDM, uv, modern setuptools). Without it, the tool
-    # would miss the majority of real modern Python repos.
+    # ---- Python — check BEFORE Node.js ----
+    # A repo with both manage.py/pyproject.toml AND package.json is a
+    # Django/Flask app with frontend assets. The Python app is primary.
     py_entry_files = ("main.py", "app.py", "server.py", "run.py",
                       "manage.py", "__main__.py")
     has_python_entry = any((repo_path / f).exists() for f in py_entry_files) \
         or (repo_path / "src/main.py").exists() \
         or (repo_path / "src/app.py").exists()
-    # Also detect: a top-level dir with __main__.py (python -m <pkg>).
-    # Do NOT require __init__.py — PEP 420 namespace packages are valid.
     if not has_python_entry:
         for entry in sorted(repo_path.iterdir()):
             if entry.is_dir() and not entry.name.startswith('.') \
@@ -760,10 +769,6 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
     if has_python_marker:
         install_cmd: list[str] = []
         if (repo_path / "requirements.txt").exists():
-            # --prefer-binary: prefer wheels over sdists. Wheels don't
-            # execute setup.py / PEP 517 build backends, so this avoids
-            # most arbitrary-code-during-install risk. sdist-only
-            # packages still trigger a build (residual risk; see README).
             install_cmd = [
                 "pip", "install", "--no-cache-dir", "--prefer-binary",
                 "-r", "requirements.txt",
@@ -779,6 +784,24 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
             deps_mount="/tmp/pip_deps" if install_cmd else None,
+        )
+
+    # ---- Node.js ----
+    if (repo_path / "package.json").exists():
+        return StackProfile(
+            name="Node.js",
+            image="node:20-slim",
+            # --ignore-scripts: do NOT run preinstall/postinstall/install
+            # lifecycle scripts. They would execute with network ON for
+            # up to 60s — the exact attack vector this tool exists to
+            # catch. Packages are still fetched and unpacked.
+            install_cmd=[
+                "npm", "install", "--ignore-scripts",
+                "--prefix", "/tmp/npm_cache",
+            ],
+            run_candidates=_detect_node_entrypoints(repo_path),
+            env={"NODE_PATH": "/tmp/npm_cache/node_modules"},
+            deps_mount="/tmp/npm_cache",
         )
 
     # Go — EXPERIMENTAL.
@@ -1226,6 +1249,17 @@ def native_execute_entrypoint(
             return result
 
         combined = (result.stdout + "\n" + result.stderr).lower()
+
+        # Monorepo detection (same logic as Docker execute_entrypoint).
+        # Check BEFORE the NOT_FOUND marker check — "Missing script"
+        # doesn't match any NOT_FOUND marker, so without this the result
+        # would be returned as a crash.
+        if stack.name == "Node.js" and "missing script" in combined:
+            workspaces = _detect_node_workspaces(repo_path)
+            if workspaces:
+                result.monorepo_no_root_entry = True
+                return result
+
         if any(marker in combined for marker in NOT_FOUND_MARKERS):
             last_result = result
             continue
@@ -1233,7 +1267,7 @@ def native_execute_entrypoint(
         return result
 
     if last_result is not None:
-        # Monorepo detection (same logic as Docker execute_entrypoint).
+        # Fallback monorepo check for the NOT_FOUND path.
         if stack.name == "Node.js":
             workspaces = _detect_node_workspaces(repo_path)
             if workspaces:
@@ -1394,6 +1428,20 @@ def execute_entrypoint(
             return result
 
         combined = (result.stdout + "\n" + result.stderr).lower()
+
+        # Monorepo detection: "npm error Missing script: start" on a
+        # workspace repo is NOT a crash — it's a missing root entrypoint.
+        # Check this BEFORE the NOT_FOUND marker check, because "Missing
+        # script" doesn't match any NOT_FOUND marker (which look for
+        # "no such file or directory", "cannot find module", etc), so
+        # the old code returned the result as a crash without ever
+        # reaching the monorepo check. (The Supabase/GitLab fix.)
+        if stack.name == "Node.js" and "missing script" in combined:
+            workspaces = _detect_node_workspaces(repo_path)
+            if workspaces:
+                result.monorepo_no_root_entry = True
+                return result
+
         if any(marker in combined for marker in NOT_FOUND_MARKERS):
             last_result = result
             continue
@@ -1401,11 +1449,8 @@ def execute_entrypoint(
         return result
 
     if last_result is not None:
-        # Check if this is a monorepo (npm workspaces) with no root
-        # entrypoint. "npm error Missing script: start" on a workspace
-        # repo is NOT a crash — it's a missing root entrypoint. Detect
-        # this and flag it so analyze_result produces a yellow verdict
-        # instead of red. (The Supabase false-alarm fix.)
+        # Fallback monorepo check for the NOT_FOUND path (e.g. index.js
+        # doesn't exist AND workspaces are declared).
         if stack.name == "Node.js":
             workspaces = _detect_node_workspaces(repo_path)
             if workspaces:
@@ -1597,9 +1642,20 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
     seen_sensitive_high: set[str] = set()
     seen_sensitive_medium: set[str] = set()
 
-    trace_files = sorted(trace_dir.glob("trace*"))
+    # strace -ff creates files named trace.<pid> and trace.<pid>.<pid>.
+    # Use 'trace.*' (not 'trace*') to avoid matching a bare 'trace' file
+    # if one exists — a bare 'trace' file would be combined output that
+    # double-counts every syscall across the per-pid files and the
+    # combined file, causing the duplicated report rendering bug.
+    trace_files = sorted(trace_dir.glob("trace.*"))
     if not trace_files:
-        return report
+        # Fallback: some strace versions write a bare 'trace' file.
+        # Only use it if no per-pid files exist.
+        bare = trace_dir / "trace"
+        if bare.exists():
+            trace_files = [bare]
+        else:
+            return report
 
     for tf in trace_files:
         try:
@@ -1674,6 +1730,10 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
                 continue
 
             # --- Network: connect (preferred — carries target info) ---
+            # Only count INTERNET (AF_INET/AF_INET6) connects as network
+            # egress attempts. AF_UNIX connects are local sockets (nscd,
+            # Docker daemon, etc) — not network egress. Counting them as
+            # "network calls" over-reports and undercuts trust in the count.
             m4 = STRACE_CONNECT_IPV4_RE.search(line)
             if m4:
                 entry = f"connect {m4.group(2)}:{m4.group(1)}"
@@ -1686,14 +1746,11 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
                 if entry not in seen_net:
                     seen_net.add(entry)
                 continue
-            mu = STRACE_CONNECT_UNIX_RE.search(line)
-            if mu:
-                entry = f"connect unix:{mu.group(1)}"
-                if entry not in seen_net:
-                    seen_net.add(entry)
-                continue
+            # AF_UNIX connects are NOT network egress — skip them.
+            # (Old behavior counted them as "connect unix:/path" which
+            # inflated the network count with local socket activity.)
             # Bare connect call we couldn't parse — still record as attempt.
-            if line.startswith("connect("):
+            if line.startswith("connect(") and "AF_UNIX" not in line:
                 entry = "connect (target unparseable)"
                 if entry not in seen_net:
                     seen_net.add(entry)

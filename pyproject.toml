@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo-proofer"
-version = "0.3.4"
+version = "0.3.5"
 description = "Brutally honest verdicts for AI-generated GitHub repos. 100% deterministic. No LLMs."
 readme = "README.md"
 license = {text = "MIT"}
