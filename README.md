@@ -45,30 +45,27 @@ $ repo-proofer file://$(pwd)/tests/fixtures/slop-repo
 - **No Docker required.** The default `--sandbox auto` uses a native bubblewrap sandbox on Linux — millisecond startup, no image pulls. Docker is the fallback for macOS/Windows or `--sandbox docker` for full clean-room isolation.
 - **Three-color verdicts.** Green `BOOTS: YES` (it ran), red `BOOTS: NO` (it crashed or tried to steal secrets), yellow `NO RUNNABLE ENTRYPOINT` (it's a library, not slop). Libraries don't get the same red as malware.
 - **Runtime Behavior Report.** strace traces every syscall inside the sandbox. You get an SBOM-style report based on *actual execution*: files read, files written, processes spawned, network calls attempted, sensitive paths touched.
-- **Installable in one command.** `uvx --from git+https://github.com/bootproof/repo-proofer.git repo-proofer <url>` — no clone, no venv, no setup. Works today, straight from GitHub.
+- **Installable in one command.** `uvx repo-proofer <url>` — no clone, no venv, no setup. Published on [PyPI](https://pypi.org/project/repo-proofer/).
 
 ## Installation
 
 Run `repo-proofer` instantly with `uvx` — no clone, no venv, no setup:
 
 ```bash
-uvx --from "git+https://github.com/bootproof/repo-proofer.git" repo-proofer https://github.com/owner/repo.git
+uvx repo-proofer https://github.com/owner/repo.git
 ```
 
 That's it. `uvx` creates an ephemeral isolated environment, installs `typer`/`rich`/`GitPython`, clones the target repo, spins up the sandbox, runs the strace, prints the verdict, and cleans up after itself.
 
-Once published to PyPI, the command shortens to:
-
-```bash
-uvx repo-proofer https://github.com/owner/repo.git
-```
-
 Other install methods:
 
 ```bash
-# Install permanently with pipx (from GitHub):
-pipx install "git+https://github.com/bootproof/repo-proofer.git"
+# Install permanently with pipx:
+pipx install repo-proofer
 repo-proofer https://github.com/owner/repo.git
+
+# Or with pip:
+pip install repo-proofer
 
 # Or from source (for development):
 git clone https://github.com/bootproof/repo-proofer.git
