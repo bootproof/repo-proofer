@@ -137,6 +137,41 @@ def test_detect_node_malformed_package_json_falls_back():
     print("[OK] detect_stack: Node.js malformed package.json -> convention fallback")
 
 
+def test_detect_node_no_duplicate_candidates():
+    """package.json with main="index.js" AND index.js exists should NOT
+    produce a duplicated ['node', 'index.js'] candidate. This was a bug
+    where the main field and the convention fallback both added the same
+    entry."""
+    repo = _make_repo({
+        "package.json": '{"name":"x","main":"index.js"}',
+        "index.js": "console.log('hi')",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    # Count occurrences of ["node", "index.js"] — must be exactly 1.
+    count = s.run_candidates.count(["node", "index.js"])
+    assert count == 1, \
+        f"Expected exactly 1 ['node', 'index.js'], got {count}: {s.run_candidates}"
+    print("[OK] detect_stack: Node.js no duplicate candidates (main + convention dedup)")
+
+
+def test_detect_python_namespace_package_main():
+    """PEP 420 namespace package: a directory with __main__.py but NO
+    __init__.py. `python -m <pkg>` works on these. The previous code
+    required __init__.py and missed this case, causing namespace-package
+    repos to come back with empty candidates and get mislabeled as slop."""
+    repo = _make_repo({
+        "myapp/__main__.py": "print('hi')",
+        # NOTE: no __init__.py — this is a PEP 420 namespace package
+    })
+    s = detect_stack(repo)
+    assert s is not None, "Namespace package with __main__.py must be detected"
+    assert s.name == "Python"
+    assert ["python", "-m", "myapp"] in s.run_candidates, \
+        f"Expected python -m myapp for namespace package, got {s.run_candidates}"
+    print("[OK] detect_stack: Python (PEP 420 namespace package __main__.py)")
+
+
 def test_detect_python_with_requirements():
     repo = _make_repo({
         "requirements.txt": "flask==3.0.0",
@@ -307,7 +342,35 @@ def test_analyze_boots_yes():
     assert v.warnings == []
     assert v.stdout_preview == "hello\n"
     assert v.detail == "exited 0"
+    assert v.no_entrypoint is False
     print("[OK] analyze_result: exit 0 -> BOOTS:YES, detail='exited 0'")
+
+
+def test_analyze_library_no_entrypoint():
+    """A library (pyproject.toml-only, no runnable entrypoint) should get
+    a NEUTRAL verdict, not red. This is the trust-preserving change: without
+    it, `click` and `markupsafe` show the same red as SSH-key-stealing
+    malware, and a skeptical first user concludes the tool is broken.
+
+    The verdict should be:
+      boots=False, no_entrypoint=True (yellow display, not red)
+      detail="no runnable entrypoint (looks like a library)"
+      warnings=[] (no crash, no network error — it just had nothing to run)
+    """
+    r = ExecutionResult(
+        stdout="",
+        stderr="No runnable entrypoint found. This looks like a library.",
+        exit_code=127,
+        no_candidates=True,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert v.no_entrypoint is True, \
+        "Library (no_candidates) must set no_entrypoint=True for yellow display"
+    assert "library" in v.detail.lower(), f"Expected 'library' in detail, got {v.detail}"
+    assert v.warnings == [], \
+        f"Library verdict should have no warnings, got {v.warnings}"
+    print("[OK] analyze_result: no_candidates -> NEUTRAL (no_entrypoint=True, yellow)")
 
 
 def test_analyze_boots_no():
@@ -746,12 +809,14 @@ def run_all():
     test_detect_node_reads_scripts_start()
     test_detect_node_reads_bin_field()
     test_detect_node_malformed_package_json_falls_back()
+    test_detect_node_no_duplicate_candidates()
     test_detect_python_with_requirements()
     test_detect_python_main_only()
     test_detect_python_server_py()
     test_detect_python_django_manage_py()
     test_detect_python_src_layout()
     test_detect_python_package_with_main()
+    test_detect_python_namespace_package_main()
     test_detect_python_pyproject_toml()
     test_detect_python_setup_py()
     test_detect_python_pyproject_no_main()
@@ -764,6 +829,7 @@ def run_all():
     print("Verdict analysis tests (readiness-aware BOOTS)")
     print("=" * 60)
     test_analyze_boots_yes()
+    test_analyze_library_no_entrypoint()
     test_analyze_boots_no()
     test_analyze_network_error_node()
     test_analyze_network_error_python()

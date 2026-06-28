@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repo-proofer"
+version = "0.1.0"
+description = "Brutally honest verdicts for AI-generated GitHub repos. 100% deterministic. No LLMs."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "bootproof"},
+]
+keywords = [
+    "security",
+    "supply-chain",
+    "sandbox",
+    "docker",
+    "strace",
+    "sbom",
+    "ai-slop",
+    "deterministic",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "GitPython>=3.1.40",
+]
+
+[project.urls]
+Homepage = "https://github.com/bootproof/repo-proofer"
+Repository = "https://github.com/bootproof/repo-proofer"
+Issues = "https://github.com/bootproof/repo-proofer/issues"
+
+# Console script entry point. After `pipx install repo-proofer` or
+# `uv tool install repo-proofer`, the `repo-proofer` command is on PATH.
+# For one-off runs without installing: `uvx repo-proofer <url>`.
+[project.scripts]
+repo-proofer = "proofer:cli"
+
+# Single-module package — proofer.py lives at the repo root, not inside
+# a package directory. This tells setuptools to install it as a top-level
+# .py module rather than looking for a package.
+[tool.setuptools]
+py-modules = ["proofer"]

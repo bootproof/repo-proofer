@@ -291,6 +291,11 @@ class ExecutionResult:
     stderr: str
     exit_code: int
     timed_out: bool = False
+    # True when the stack had NO runnable entrypoint candidates at all
+    # (e.g. a pyproject.toml-only library like `click` or `markupsafe`).
+    # This is distinct from a crash — it means there was nothing to run.
+    # Used by analyze_result to produce a neutral verdict instead of red.
+    no_candidates: bool = False
 
 
 @dataclass
@@ -306,6 +311,12 @@ class Verdict:
     # Examples: "exited 0", "long-running process (timed out at 30s, no crash)",
     #           "server detected: listening on port 8080", "exited 1 (crash)"
     detail: str = ""
+    # True when the repo was detected as a known stack but had NO runnable
+    # entrypoint (e.g. a pyproject.toml-only library). This gets a NEUTRAL
+    # yellow verdict instead of red — a library is not slop, it just has
+    # nothing to run. Without this, `click` and `markupsafe` would show
+    # the same red as an SSH-key-stealing malware repo, which erodes trust.
+    no_entrypoint: bool = False
 
 
 @dataclass
@@ -376,8 +387,11 @@ def _detect_node_entrypoints(repo_path: Path) -> list[list[str]]:
         candidates.append(["node", bin_field[first]])
 
     # Convention fallbacks (only added if the file actually exists).
+    # Dedup against any candidates already added from package.json fields
+    # (e.g. if main="index.js" AND index.js exists, we'd add ["node", "index.js"]
+    # twice without this check).
     for f in ("index.js", "app.js", "server.js", "main.js"):
-        if (repo_path / f).exists():
+        if (repo_path / f).exists() and ["node", f] not in candidates:
             candidates.append(["node", f])
 
     # Always try `npm start` last as a final fallback if we haven't
@@ -426,10 +440,13 @@ def _detect_python_entrypoints(repo_path: Path) -> list[list[str]]:
     if (repo_path / "__main__.py").exists():
         candidates.append(["python", "__main__.py"])
     else:
-        # Look for a top-level package (dir with __init__.py) that has
-        # a __main__.py — that's `python -m <pkg>`.
+        # Look for a top-level dir with __main__.py — that's `python -m <pkg>`.
+        # We do NOT require __init__.py: PEP 420 namespace packages (dirs
+        # with __main__.py but no __init__.py) are valid `python -m` targets.
+        # Requiring __init__.py was a bug that caused namespace-package repos
+        # to come back with empty candidates and get mislabeled as slop.
         for entry in sorted((repo_path).iterdir()):
-            if entry.is_dir() and (entry / "__init__.py").exists() \
+            if entry.is_dir() and not entry.name.startswith('.') \
                     and (entry / "__main__.py").exists():
                 candidates.append(["python", "-m", entry.name])
                 break  # one is enough; deterministic via sorted()
@@ -483,10 +500,11 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
     has_python_entry = any((repo_path / f).exists() for f in py_entry_files) \
         or (repo_path / "src/main.py").exists() \
         or (repo_path / "src/app.py").exists()
-    # Also detect: a top-level package dir (has __init__.py) with __main__.py
+    # Also detect: a top-level dir with __main__.py (python -m <pkg>).
+    # Do NOT require __init__.py — PEP 420 namespace packages are valid.
     if not has_python_entry:
         for entry in sorted(repo_path.iterdir()):
-            if entry.is_dir() and (entry / "__init__.py").exists() \
+            if entry.is_dir() and not entry.name.startswith('.') \
                     and (entry / "__main__.py").exists():
                 has_python_entry = True
                 break
@@ -821,6 +839,19 @@ def execute_entrypoint(
     # therefore reflects only the LAST attempted candidate — which is
     # exactly what we want, since the successful/last attempt is the
     # one whose behavior matters.
+    # If the stack has NO runnable entrypoint candidates (e.g. a library
+    # like `click` that ships pyproject.toml but no main.py/server.py/etc),
+    # return immediately with no_candidates=True. analyze_result uses this
+    # to produce a neutral yellow verdict instead of red — a library is
+    # not slop, it just has nothing to run.
+    if not stack.run_candidates:
+        return ExecutionResult(
+            stdout="",
+            stderr="No runnable entrypoint found. This looks like a library.",
+            exit_code=127,
+            no_candidates=True,
+        )
+
     last_result: Optional[ExecutionResult] = None
     for candidate in stack.run_candidates:
         if use_strace:
@@ -856,6 +887,7 @@ def execute_entrypoint(
             + ", ".join(" ".join(c) for c in stack.run_candidates)
         ),
         exit_code=127,
+        no_candidates=True,
     )
 
 
@@ -868,6 +900,8 @@ def analyze_result(result: ExecutionResult) -> Verdict:
 
     BOOTS semantics (readiness-aware, not just exit-code-aware):
 
+      no candidates (library)        -> NEUTRAL     ("no runnable entrypoint
+                                                     (looks like a library)")
       exit 0 (clean exit)            -> BOOTS: YES  ("exited 0")
       timed out, no crash signature  -> BOOTS: YES  ("long-running process
                                                     (timed out at Ns,
@@ -882,10 +916,32 @@ def analyze_result(result: ExecutionResult) -> Verdict:
     triage. A process that stays alive for the full timeout without
     crashing HAS booted — it's just long-running.
 
+    A separate case: when the stack has NO runnable entrypoint at all
+    (a library like `click` or `markupsafe` — pyproject.toml but no
+    main.py), we produce a NEUTRAL verdict, not red. A library is not
+    slop; showing it the same red as SSH-key-stealing malware erodes
+    trust. The `no_entrypoint` flag drives a yellow display color and
+    exit code 0 in main().
+
     Readiness signals ("listening on port 8080", "Uvicorn running",
     "server started", etc.) upgrade a timeout from "long-running" to
     "server detected" so the user gets more signal.
     """
+    # ---- Library / no-entrypoint case ----
+    # Short-circuit before any crash/network analysis. A library that
+    # was detected but has nothing to run is not a failure.
+    if result.no_candidates:
+        return Verdict(
+            boots=False,
+            network_egress_blocked=True,
+            filesystem_read_only=True,
+            stdout_preview=result.stdout[:MAX_STDOUT_CHARS],
+            stderr_preview=result.stderr[:MAX_STDERR_CHARS],
+            warnings=[],
+            detail="no runnable entrypoint (looks like a library)",
+            no_entrypoint=True,
+        )
+
     warnings: list[str] = []
     combined = result.stdout + "\n" + result.stderr
     combined_lower = combined.lower()
@@ -1092,11 +1148,19 @@ def print_verdict(
     install_result: Optional[ExecutionResult],
 ) -> None:
     """Print the brutal honest verdict via rich panels."""
-    boots_str = (
-        "[bold green]YES[/bold green]"
-        if verdict.boots
-        else "[bold red]NO[/bold red]"
-    )
+    # Three-color verdict system:
+    #   GREEN  — BOOTS: YES (clean exit, long-running, or server detected)
+    #   RED    — BOOTS: NO (crashed, network-blocked, sensitive access)
+    #   YELLOW — NO RUNNABLE ENTRYPOINT (library, nothing to run)
+    # The yellow state is critical for trust: without it, a library like
+    # `click` shows the same red as SSH-key-stealing malware, and a
+    # skeptical first user concludes the tool is broken.
+    if verdict.no_entrypoint:
+        boots_str = "[bold yellow]NO RUNNABLE ENTRYPOINT[/bold yellow]"
+    elif verdict.boots:
+        boots_str = "[bold green]YES[/bold green]"
+    else:
+        boots_str = "[bold red]NO[/bold red]"
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="bold cyan", no_wrap=True)
@@ -1403,6 +1467,12 @@ def main(
                 )
             raise typer.Exit(code=1)
 
+        # A library (no runnable entrypoint) is not slop — exit 0 so CI
+        # doesn't block on library repos. The verdict display is yellow,
+        # not red, so the user sees it's a neutral result, not a failure.
+        if verdict.no_entrypoint:
+            raise typer.Exit(code=0)
+
         # Exit code reflects boots status (useful for scripting / CI).
         raise typer.Exit(code=0 if verdict.boots else 1)
 
@@ -1421,5 +1491,18 @@ def main(
                 shutil.rmtree(trace_dir, ignore_errors=True)
 
 
-if __name__ == "__main__":
+def cli():
+    """Entry point for the repo-proofer console script.
+
+    This function is referenced by pyproject.toml's [project.scripts]
+    section, enabling `uvx repo-proofer <url>` and `pipx run repo-proofer <url>`
+    after the package is published to PyPI. For local development, use:
+        uvx --from . repo-proofer <url>
+        # or
+        pipx install . && repo-proofer <url>
+    """
     typer.run(main)
+
+
+if __name__ == "__main__":
+    cli()

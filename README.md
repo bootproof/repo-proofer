@@ -40,6 +40,25 @@ If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdi
 
 ## Install
 
+### Option 1: One-command install (recommended)
+
+Once published to PyPI:
+
+```bash
+# Using uv (fastest — no install needed, runs from cache):
+uvx repo-proofer https://github.com/owner/repo.git
+
+# Or install permanently with pipx:
+pipx install repo-proofer
+repo-proofer https://github.com/owner/repo.git
+
+# Or with uv tool install:
+uv tool install repo-proofer
+repo-proofer https://github.com/owner/repo.git
+```
+
+### Option 2: From source (for development)
+
 ```bash
 git clone https://github.com/bootproof/repo-proofer.git
 cd repo-proofer
@@ -48,6 +67,8 @@ cd repo-proofer
 python3 -m venv .venv
 source .venv/bin/activate
 
+pip install -e .          # installs proofer.py + deps + `repo-proofer` command
+# or just:
 pip install -r requirements.txt
 ```
 
@@ -88,14 +109,16 @@ python proofer.py https://github.com/owner/repo.git --no-behavior-report
 
 | Code | Meaning                                              |
 |------|------------------------------------------------------|
-| 0    | Repo boots cleanly under sandboxed execution.        |
+| 0    | Repo boots cleanly, OR is a library (no entrypoint).|
 | 1    | Repo does NOT boot (non-zero exit, sensitive access).|
 | 2    | Clone failed.                                        |
 | 3    | Docker not installed / daemon not running.           |
 | 4    | Could not detect project stack.                      |
 | 5    | Failed to pull Docker image.                         |
 
-The exit code is CI-friendly: wire it into a GitHub Actions workflow and any repo that can't boot offline blocks the PR.
+> **Note on exit code 0 for libraries:** A repo detected as a known stack but with no runnable entrypoint (e.g. `click`, `markupsafe` — a library, not an app) exits 0 with a yellow `NO RUNNABLE ENTRYPOINT` verdict. This is NOT the same red as a crashed/slop repo. Libraries are not slop; they just have nothing to run. CI pipelines won't block on library repos.
+
+The exit code is CI-friendly: wire it into a GitHub Actions workflow and any repo that crashes or attempts sensitive access blocks the PR.
 
 ---
 
@@ -112,14 +135,18 @@ python proofer.py file://$(pwd)/tests/fixtures/slop-repo
 Or point it at any public GitHub URL:
 
 ```bash
-# A well-maintained Python package with requirements.txt
+# A Python library — will return NO RUNNABLE ENTRYPOINT (yellow, exit 0).
+# This is the correct verdict for a library: it's not slop, just nothing to run.
 python proofer.py https://github.com/pallets/markupsafe.git
 
-# A simple Node.js package
-python proofer.py https://github.com/sindresorhus/is-odd.git
+# Or use the installed command:
+repo-proofer https://github.com/pallets/markupsafe.git
 ```
 
-> **Note:** repos with `pyproject.toml` + `src/` layouts (like `pallets/click`) are now *detected* but may report `BOOTS: NO` if they're libraries with no runnable entrypoint — that's the honest verdict for a library, not a tool failure.
+> **Three-color verdict system:**
+> - **GREEN `BOOTS: YES`** — the repo ran successfully (clean exit, long-running server, or readiness signal detected).
+> - **RED `BOOTS: NO`** — the repo crashed or attempted sensitive file access. This is the slop signal.
+> - **YELLOW `NO RUNNABLE ENTRYPOINT`** — the repo was detected as a known stack but has nothing to run (a library). Not slop, just not runnable. Exits 0 so CI doesn't block.
 
 ### Run the full test suite
 
@@ -232,8 +259,11 @@ This tool is honest about what it can and can't do. The gaps below are real; wor
 ## Roadmap
 
 - [x] Phase 1: Open-source CLI (this repo)
+- [x] `uvx` / `pipx` packaging (`pyproject.toml` + console script)
+- [x] Three-color verdict system (green/red/yellow — libraries are not slop)
 - [ ] Phase 2: Cloud API + runtime-behavior database
 - [ ] Phase 3: Enterprise CI/CD gate (GitHub Actions / GitLab CI plugin)
+- [ ] Non-Docker sandbox mode (bubblewrap/nsjail) for zero-install consumer triage
 
 ---
 
