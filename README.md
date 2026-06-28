@@ -45,31 +45,32 @@ $ repo-proofer file://$(pwd)/tests/fixtures/slop-repo
 - **No Docker required.** The default `--sandbox auto` uses a native bubblewrap sandbox on Linux — millisecond startup, no image pulls. Docker is the fallback for macOS/Windows or `--sandbox docker` for full clean-room isolation.
 - **Three-color verdicts.** Green `BOOTS: YES` (it ran), red `BOOTS: NO` (it crashed or tried to steal secrets), yellow `NO RUNNABLE ENTRYPOINT` (it's a library, not slop). Libraries don't get the same red as malware.
 - **Runtime Behavior Report.** strace traces every syscall inside the sandbox. You get an SBOM-style report based on *actual execution*: files read, files written, processes spawned, network calls attempted, sensitive paths touched.
-- **Installable in one command.** `uvx repo-proofer <url>` — no clone, no venv, no setup.
+- **Installable in one command.** `uvx --from git+https://github.com/bootproof/repo-proofer.git repo-proofer <url>` — no clone, no venv, no setup. Works today, straight from GitHub.
 
 ## Installation
 
-Install `repo-proofer` from [PyPI](https://pypi.org/project/repo-proofer/):
+Run `repo-proofer` instantly with `uvx` — no clone, no venv, no setup:
 
 ```bash
-# With uv (no install needed — runs from cache):
+uvx --from "git+https://github.com/bootproof/repo-proofer.git" repo-proofer https://github.com/owner/repo.git
+```
+
+That's it. `uvx` creates an ephemeral isolated environment, installs `typer`/`rich`/`GitPython`, clones the target repo, spins up the sandbox, runs the strace, prints the verdict, and cleans up after itself.
+
+Once published to PyPI, the command shortens to:
+
+```bash
 uvx repo-proofer https://github.com/owner/repo.git
 ```
 
+Other install methods:
+
 ```bash
-# Or with pipx:
-pipx install repo-proofer
+# Install permanently with pipx (from GitHub):
+pipx install "git+https://github.com/bootproof/repo-proofer.git"
 repo-proofer https://github.com/owner/repo.git
-```
 
-```bash
-# Or with pip:
-pip install repo-proofer
-```
-
-From source:
-
-```bash
+# Or from source (for development):
 git clone https://github.com/bootproof/repo-proofer.git
 cd repo-proofer
 pip install -e .
