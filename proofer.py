@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.8"
+__version__ = "0.4.0"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -174,6 +174,14 @@ STRACE_CONNECT_UNIX_RE = re.compile(
 # connect (no target), but still indicates network intent.
 STRACE_SOCKET_INET_RE = re.compile(
     r'^socket\([^,]*AF_INET[6]?[^,]*,'
+)
+
+# bind() — extract the port the app tried to listen on. Used by the
+# claim-matching layer to verify "starts a server on port 3000" claims.
+# strace format: bind(3, {sa_family=AF_INET, sin_port=htons(3000), ...}) = 0
+STRACE_BIND_PORT_RE = re.compile(
+    r'bind\(\d+,\s*\{sa_family=AF_INET[6]?,\s*'
+    r'sin6?_port=htons\((\d+)\)'
 )
 
 # Paths the runtime itself touches on every program start. Filtering
@@ -400,6 +408,9 @@ class BehaviorReport:
     writes_blocked: list[str] = field(default_factory=list)
     processes_spawned: list[str] = field(default_factory=list)
     network_attempts: list[str] = field(default_factory=list)
+    # Ports the app tried to bind() — used by claim matching to verify
+    # "starts a server on port 3000" type README claims.
+    ports_bound: list[str] = field(default_factory=list)
     # HIGH-severity sensitive access: SSH keys, .env, /etc/shadow, AWS
     # creds. Triggers "malicious intent" ONLY when correlated with a
     # network attempt (the exfil smoking gun).
@@ -414,8 +425,326 @@ class BehaviorReport:
         return any([
             self.files_read, self.files_written, self.writes_blocked,
             self.processes_spawned, self.network_attempts,
+            self.ports_bound,
             self.sensitive_access, self.medium_sensitive_access,
         ])
+
+
+# ----------------------------------------------------------------------
+# Claim extraction — deterministic, regex-based, NO LLMs
+# ----------------------------------------------------------------------
+#
+# The original vision asked for "N of M README claims observed to
+# execute." This is the layer that delivers it — without any AI.
+#
+# We extract TESTABLE assertions from the README using regex patterns:
+# port numbers, database services, API integrations, install/run
+# commands, file types, frameworks. Each claim is then matched against
+# the runtime evidence (strace trace, stdout, exit code).
+#
+# Three possible verdicts per claim:
+#   VERIFIED     — runtime evidence supports the claim
+#   UNVERIFIED   — no evidence found (claim might be true under
+#                  different conditions, but we didn't observe it)
+#   UNVERIFIABLE — we can't check this claim type with our tools
+
+# Regex patterns for claim extraction. Each is (pattern, claim_type).
+# The claim_type determines how we match against runtime evidence.
+CLAIM_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Port claims: "listening on port 3000", "runs on :8080", "port 5000"
+    (re.compile(
+        r'(?:listening|runs?|starts?|serves?|binds?)\s+(?:on\s+)?(?:port\s+)?[:]?(\d{4,5})',
+        re.IGNORECASE), "port"),
+
+    # Database/service claims: "connects to PostgreSQL", "requires Redis"
+    (re.compile(
+        r'(?:connects?\s+to|requires?|uses?|powered\s+by|stores?\s+(?:in|to|data\s+in))\s+'
+        r'(postgresql|postgres|mysql|redis|mongodb|mongo|elasticsearch|sqlite|supabase)',
+        re.IGNORECASE), "service"),
+
+    # API claims: "uses the OpenAI API", "integrates with Stripe"
+    (re.compile(
+        r'(?:uses?|requires?|integrates?\s+with|calls?)\s+(?:the\s+)?'
+        r'(openai|anthropic|stripe|github|twitter|slack|aws)\s*(?:api)?',
+        re.IGNORECASE), "api"),
+
+    # Install commands from README code blocks
+    (re.compile(r'pip\s+install\s+(?:-r\s+)?requirements\.txt'), "install_python"),
+    (re.compile(r'npm\s+install'), "install_node"),
+    (re.compile(r'cargo\s+(?:build|install)'), "install_rust"),
+    (re.compile(r'go\s+mod\s+(?:download|vendor)'), "install_go"),
+
+    # Run commands from README code blocks
+    (re.compile(r'python\s+(main|app|server|run|manage)\.py'), "run_python"),
+    (re.compile(r'node\s+(index|app|server|main)\.js'), "run_node"),
+    (re.compile(r'npm\s+start'), "run_npm_start"),
+    (re.compile(r'cargo\s+run'), "run_cargo"),
+    (re.compile(r'go\s+run\s+(?:main\.go)?'), "run_go"),
+
+    # File processing: "processes CSV files", "reads JSON"
+    (re.compile(
+        r'(?:processes?|reads?|writes?|parses?|handles?|imports?|exports?)\s+'
+        r'\.?(csv|json|xml|yaml|yml|toml|excel|xlsx)\s+files?',
+        re.IGNORECASE), "file_type"),
+
+    # Framework: "built with Flask", "uses Express"
+    (re.compile(
+        r'(?:built\s+with|uses?|powered\s+by|written\s+in)\s+'
+        r'(flask|django|fastapi|express|nextjs|next\.js|react|vue|angular|spring|rails|starlette)',
+        re.IGNORECASE), "framework"),
+]
+
+# Known service → port mapping for database/service claim matching
+SERVICE_PORTS = {
+    "postgresql": "5432", "postgres": "5432",
+    "mysql": "3306", "redis": "6379",
+    "mongodb": "27017", "mongo": "27017",
+    "elasticsearch": "9200", "sqlite": None,  # SQLite is local file, no port
+    "supabase": "5432",  # Supabase uses Postgres
+}
+
+
+@dataclass
+class Claim:
+    """A testable assertion extracted from the README."""
+    text: str           # The original claim text from the README
+    claim_type: str     # "port", "service", "api", "install_python", etc.
+    expected: str       # What we expect to see (e.g., "3000" for port)
+    source_line: int    # Line number in the README
+
+
+@dataclass
+class ClaimMatch:
+    """The result of matching a claim against runtime evidence."""
+    claim: Claim
+    status: str         # "VERIFIED", "UNVERIFIED", "UNVERIFIABLE"
+    evidence: str       # What we observed (or why we couldn't verify)
+
+
+def extract_claims(repo_path: Path) -> list[Claim]:
+    """Extract testable claims from the README. 100% deterministic.
+
+    Reads README.md (or README.rst, README.txt, README) and applies
+    regex patterns to find testable assertions. No LLMs, no AI — just
+    regex. This means we'll miss nuanced claims, but every claim we
+    extract is checkable and the extraction is reproducible.
+    """
+    # Find the README file
+    readme_path: Optional[Path] = None
+    for name in ("README.md", "README.rst", "README.txt", "README",
+                 "readme.md", "readme"):
+        candidate = repo_path / name
+        if candidate.exists():
+            readme_path = candidate
+            break
+
+    if readme_path is None:
+        return []
+
+    try:
+        text = readme_path.read_text(errors="replace")
+    except OSError:
+        return []
+
+    claims: list[Claim] = []
+    seen: set[tuple[str, str]] = set()  # Dedup by (claim_type, expected)
+
+    for line_num, line in enumerate(text.splitlines(), 1):
+        for pattern, claim_type in CLAIM_PATTERNS:
+            # Use finditer to catch ALL matches on a line (e.g., "processes
+            # CSV files and exports JSON files" has two file_type matches).
+            for m in pattern.finditer(line):
+                # Some patterns have a capture group (port, service, etc),
+                # others don't (install_python, run_npm_start). Handle both.
+                try:
+                    expected = m.group(1).lower().rstrip(".")
+                except IndexError:
+                    expected = claim_type  # No capture group — use the type
+                # Dedup — don't extract the same claim multiple times
+                key = (claim_type, expected)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Trim the claim text to a reasonable length
+                claim_text = line.strip()[:120]
+                claims.append(Claim(
+                    text=claim_text,
+                    claim_type=claim_type,
+                    expected=expected,
+                    source_line=line_num,
+                ))
+
+    return claims
+
+
+def match_claims(
+    claims: list[Claim],
+    behavior_report: BehaviorReport,
+    exec_result: ExecutionResult,
+    stack: StackProfile,
+    repo_path: Path,
+) -> list[ClaimMatch]:
+    """Match each claim against runtime evidence.
+
+    Deterministic — no AI, no fuzzy matching. Each claim type has its
+    own matching logic that checks specific runtime evidence.
+    """
+    matches: list[ClaimMatch] = []
+
+    for claim in claims:
+        match = _match_single_claim(
+            claim, behavior_report, exec_result, stack, repo_path
+        )
+        matches.append(match)
+
+    return matches
+
+
+def _match_single_claim(
+    claim: Claim,
+    report: BehaviorReport,
+    exec_result: ExecutionResult,
+    stack: StackProfile,
+    repo_path: Path,
+) -> ClaimMatch:
+    """Match a single claim against runtime evidence."""
+
+    if claim.claim_type == "port":
+        port = claim.expected
+        # Check if the app bound to this port
+        if port in report.ports_bound:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"App bound to port {port} (strace bind() observed)")
+        # Check if stdout mentioned the port (readiness signal)
+        combined = exec_result.stdout + exec_result.stderr
+        if port in combined:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Port {port} mentioned in output")
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"No bind() or output mentioning port {port}")
+
+    elif claim.claim_type == "service":
+        service = claim.expected
+        port = SERVICE_PORTS.get(service)
+        if port is None:
+            # SQLite is local — check if any .db/.sqlite file was opened
+            if service == "sqlite":
+                for f in report.files_read + report.files_written:
+                    if f.endswith((".db", ".sqlite", ".sqlite3")):
+                        return ClaimMatch(claim, "VERIFIED",
+                                          f"SQLite database file accessed: {f}")
+                return ClaimMatch(claim, "UNVERIFIED",
+                                  "No SQLite database file accessed")
+            return ClaimMatch(claim, "UNVERIFIABLE",
+                              f"Unknown service: {service}")
+        # Check if the app tried to connect to the service port
+        for net in report.network_attempts:
+            if f":{port}" in net:
+                return ClaimMatch(claim, "VERIFIED",
+                                  f"Network connect to port {port} ({service}) observed")
+        # Check if stderr mentions connection refused on this port
+        combined = (exec_result.stdout + exec_result.stderr).lower()
+        if port in combined and ("refused" in combined or "connection" in combined):
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Connection attempt to {service} (port {port}) in stderr")
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"No connect() to port {port} ({service}) observed")
+
+    elif claim.claim_type == "api":
+        api = claim.expected
+        # Under --network none, the app can't reach the API, but it may
+        # try. Check if any network attempt was made (the app tried to
+        # phone home to SOME API).
+        if report.network_attempts:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Network attempt(s) observed (API call blocked by sandbox): "
+                              f"{', '.join(report.network_attempts[:3])}")
+        # Check if the app read credentials (.env, API key files)
+        if report.sensitive_access:
+            return ClaimMatch(claim, "VERIFIED",
+                              "Credential file access observed (API key read)")
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"No network attempts or credential reads for {api} API")
+
+    elif claim.claim_type.startswith("install_"):
+        # Check if the install command matches what we actually ran
+        install_str = " ".join(stack.install_cmd) if stack.install_cmd else ""
+        if claim.claim_type == "install_python" and "pip install" in install_str:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Install used: {install_str}")
+        if claim.claim_type == "install_node" and "npm install" in install_str:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Install used: {install_str}")
+        if claim.claim_type == "install_rust" and "cargo" in install_str:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Install used: {install_str}")
+        if claim.claim_type == "install_go" and "go mod" in install_str:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Install used: {install_str}")
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"Install command was: {install_str or '(none)'}")
+
+    elif claim.claim_type.startswith("run_"):
+        # Check if the run command matches what we actually tried
+        candidates_str = " ".join(
+            " ".join(c) for c in stack.run_candidates
+        )
+        if claim.expected in candidates_str or claim.text.split()[0:2] == \
+                stack.run_candidates[0][0:2] if stack.run_candidates else False:
+            return ClaimMatch(claim, "VERIFIED",
+                              f"Entrypoint tried: {candidates_str}")
+        # More flexible: check if the expected file/command appears
+        for candidate in stack.run_candidates:
+            if claim.expected in " ".join(candidate):
+                return ClaimMatch(claim, "VERIFIED",
+                                  f"Entrypoint tried: {' '.join(candidate)}")
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"Entrypoint(s) tried: {candidates_str}")
+
+    elif claim.claim_type == "file_type":
+        ext = claim.expected
+        # Check if any file with this extension was opened
+        for f in report.files_read + report.files_written:
+            if f.endswith(f".{ext}"):
+                return ClaimMatch(claim, "VERIFIED",
+                                  f" .{ext} file accessed: {f}")
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"No .{ext} files accessed during execution")
+
+    elif claim.claim_type == "framework":
+        framework = claim.expected
+        # Check if framework modules were read from strace
+        for f in report.files_read:
+            if framework in f.lower():
+                return ClaimMatch(claim, "VERIFIED",
+                                  f"Framework module read: {f}")
+        # Check if framework appears in requirements.txt/package.json
+        deps_file = repo_path / "requirements.txt"
+        if deps_file.exists():
+            try:
+                deps_text = deps_file.read_text().lower()
+                if framework in deps_text:
+                    return ClaimMatch(claim, "VERIFIED",
+                                      f"Framework in requirements.txt")
+            except OSError:
+                pass
+        pkg_file = repo_path / "package.json"
+        if pkg_file.exists():
+            try:
+                import json
+                pkg = json.loads(pkg_file.read_text())
+                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                for dep_name in deps:
+                    if framework in dep_name.lower():
+                        return ClaimMatch(claim, "VERIFIED",
+                                          f"Framework in package.json: {dep_name}")
+            except (OSError, ValueError):
+                pass
+        return ClaimMatch(claim, "UNVERIFIED",
+                          f"No evidence of {framework} in strace or deps")
+
+    return ClaimMatch(claim, "UNVERIFIABLE",
+                      f"Unknown claim type: {claim.claim_type}")
 
 
 # ----------------------------------------------------------------------
@@ -1264,7 +1593,7 @@ def native_execute_entrypoint(
         base_args += ["--"]
         strace_prefix = [
             "strace", "-ff",
-            "-e", "trace=openat,open,openat2,creat,execve,execveat,connect,socket,unlink,unlinkat",
+            "-e", "trace=openat,open,openat2,creat,execve,execveat,connect,socket,bind,unlink,unlinkat",
             "-o", "/trace/trace",
             "--",
         ]
@@ -1448,7 +1777,7 @@ def execute_entrypoint(
         if use_strace:
             cmd = [
                 "-ff",  # Follow forks; one output file per process.
-                "-e", "trace=openat,open,openat2,creat,execve,execveat,connect,socket,unlink,unlinkat",
+                "-e", "trace=openat,open,openat2,creat,execve,execveat,connect,socket,bind,unlink,unlinkat",
                 "-o", "/trace/trace",
                 "--",  # Stop option parsing; rest is the command to trace.
             ] + candidate
@@ -1749,6 +2078,7 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
     seen_net: set[str] = set()
     seen_sensitive_high: set[str] = set()
     seen_sensitive_medium: set[str] = set()
+    seen_ports_bound: set[str] = set()
 
     # strace -ff creates files named trace.<pid> and trace.<pid>.<pid>.
     # Use 'trace.*' (not 'trace*') to avoid matching a bare 'trace' file
@@ -1871,11 +2201,22 @@ def parse_strace_output(trace_dir: Path) -> BehaviorReport:
                     seen_net.add(entry)
                 continue
 
+            # --- bind() — port the app tried to listen on ---
+            # Used by the claim-matching layer to verify "starts a server
+            # on port 3000" type README claims.
+            m_bind = STRACE_BIND_PORT_RE.search(line)
+            if m_bind:
+                port = m_bind.group(1)
+                if port not in seen_ports_bound:
+                    seen_ports_bound.add(port)
+                continue
+
     report.files_read = sorted(set(seen_reads))
     report.files_written = sorted(set(seen_writes))
     report.writes_blocked = sorted(set(seen_writes_blocked))
     report.processes_spawned = sorted(set(seen_procs))
     report.network_attempts = sorted(set(seen_net))
+    report.ports_bound = sorted(set(seen_ports_bound))
     report.sensitive_access = sorted(set(seen_sensitive_high))
     report.medium_sensitive_access = sorted(set(seen_sensitive_medium))
     return report
@@ -2071,9 +2412,93 @@ def print_behavior_report(report: BehaviorReport) -> None:
         ))
 
 
-# ----------------------------------------------------------------------
-# Main flow
-# ----------------------------------------------------------------------
+def print_claim_report(matches: list[ClaimMatch]) -> None:
+    """Print the README Claim Verification report.
+
+    This is the layer that turns 'did it boot' into 'is it slop'.
+    Extracts testable claims from the README and maps each to runtime
+    evidence. A repo that boots cleanly but has 0 of 5 claims verified
+    is likely slop — its README promises things the code doesn't do.
+    """
+    if not matches:
+        # No claims extracted (no README, or README had no testable claims)
+        console.print(Panel(
+            "[dim]No testable claims found in README.[/dim]\n"
+            "[dim]Claim verification requires a README with specific, "
+            "checkable assertions (ports, services, frameworks, "
+            "install/run commands, file types).[/dim]",
+            title="[bold blue]README Claim Verification[/bold blue]",
+            border_style="blue",
+        ))
+        return
+
+    verified = [m for m in matches if m.status == "VERIFIED"]
+    unverified = [m for m in matches if m.status == "UNVERIFIED"]
+    unverifiable = [m for m in matches if m.status == "UNVERIFIABLE"]
+    total = len(matches)
+
+    # Summary table
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="bold cyan", no_wrap=True)
+    table.add_column()
+    table.add_row("Claims Verified", f"[bold green]{len(verified)}[/bold green] of {total}")
+    if unverified:
+        table.add_row("Claims Unverified", f"[yellow]{len(unverified)}[/yellow]")
+    if unverifiable:
+        table.add_row("Claims Unverifiable", f"[dim]{len(unverifiable)}[/dim]")
+
+    # The headline: what percentage of claims were backed by execution?
+    pct = (len(verified) / total * 100) if total > 0 else 0
+    if pct == 100:
+        verdict_line = f"[bold green]All {total} README claims verified by execution.[/bold green]"
+    elif pct >= 50:
+        verdict_line = f"[yellow]{len(verified)} of {total} claims verified — some claims not observed in execution.[/yellow]"
+    elif pct > 0:
+        verdict_line = f"[bold red]{len(verified)} of {total} claims verified — most claims NOT observed in execution. Possible slop.[/bold red]"
+    else:
+        verdict_line = f"[bold red]0 of {total} claims verified — README does not match execution. Likely slop.[/bold red]"
+
+    console.print(Panel(
+        table,
+        title="[bold blue]README Claim Verification[/bold blue]",
+        border_style="blue",
+        subtitle=f"[dim]{verdict_line}[/dim]",
+    ))
+
+    # Verified claims
+    if verified:
+        console.print(Panel(
+            "\n".join(
+                f"[green]\u2713[/green] {m.claim.text}\n"
+                f"  [dim]{m.evidence}[/dim]"
+                for m in verified
+            ),
+            title=f"[green]Verified ({len(verified)})[/green]",
+            border_style="green",
+        ))
+
+    # Unverified claims — the "confident-looking garbage" section
+    if unverified:
+        console.print(Panel(
+            "\n".join(
+                f"[yellow]\u26a0[/yellow] {m.claim.text}\n"
+                f"  [dim]{m.evidence}[/dim]"
+                for m in unverified
+            ),
+            title=f"[yellow]Unverified ({len(unverified)})[/yellow]",
+            border_style="yellow",
+        ))
+
+    # Unverifiable claims
+    if unverifiable:
+        console.print(Panel(
+            "\n".join(
+                f"[dim]? {m.claim.text}\n  {m.evidence}[/dim]"
+                for m in unverifiable
+            ),
+            title=f"[dim]Unverifiable ({len(unverifiable)})[/dim]",
+            border_style="dim",
+        ))
 
 def _select_backend(
     preference: str, stack: Optional[StackProfile]
@@ -2311,6 +2736,18 @@ def main(
         # ---- Step 6: Print verdict ----------------------------------
         print_verdict(verdict, repo_url, stack.name, install_result)
         print_behavior_report(behavior_report)
+
+        # ---- Step 6a: README Claim Verification --------------------
+        # This is the layer that turns "did it boot" into "is it slop".
+        # Extracts testable claims from the README and matches each
+        # against runtime evidence. A repo that boots cleanly but has
+        # 0 of 5 claims verified is likely slop.
+        claims = extract_claims(repo_dir)
+        if claims:
+            claim_matches = match_claims(
+                claims, behavior_report, exec_result, stack, repo_dir,
+            )
+            print_claim_report(claim_matches)
 
         # ---- Step 6b: Sensitive-access escalation (correlation-gated) -----
         # The smoking gun for exfiltration is "read a secret AND THEN

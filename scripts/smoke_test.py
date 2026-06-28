@@ -29,9 +29,13 @@ from proofer import (
     detect_stack,
     analyze_result,
     parse_strace_output,
+    extract_claims,
+    match_claims,
     ExecutionResult,
     BehaviorReport,
     StackProfile,
+    Claim,
+    ClaimMatch,
     NETWORK_ERROR_RE,
     STRACE_OPEN_RE,
     STRACE_WRITE_FLAGS_RE,
@@ -1501,6 +1505,213 @@ def test_select_backend_native_with_stack_runtime_check():
 
 
 # ----------------------------------------------------------------------
+# README Claim Verification tests
+# ----------------------------------------------------------------------
+
+def test_extract_claims_port():
+    """Extract port claims from README text."""
+    repo = _make_repo({
+        "README.md": (
+            "# My App\n\n"
+            "A web server that starts on port 3000.\n"
+            "Also listening on port 8080.\n"
+        ),
+    })
+    claims = extract_claims(repo)
+    port_claims = [c for c in claims if c.claim_type == "port"]
+    assert len(port_claims) == 2, f"Expected 2 port claims, got {len(port_claims)}: {port_claims}"
+    ports = {c.expected for c in port_claims}
+    assert "3000" in ports
+    assert "8080" in ports
+    print("[OK] extract_claims: port claims extracted (3000, 8080)")
+
+
+def test_extract_claims_service():
+    """Extract database/service claims."""
+    repo = _make_repo({
+        "README.md": (
+            "# My App\n\n"
+            "Connects to PostgreSQL for data storage.\n"
+            "Uses Redis for caching.\n"
+        ),
+    })
+    claims = extract_claims(repo)
+    service_claims = [c for c in claims if c.claim_type == "service"]
+    assert len(service_claims) >= 2, f"Expected 2+ service claims, got {len(service_claims)}"
+    services = {c.expected for c in service_claims}
+    assert "postgresql" in services
+    assert "redis" in services
+    print("[OK] extract_claims: service claims extracted (postgresql, redis)")
+
+
+def test_extract_claims_install_and_run():
+    """Extract install and run commands from README."""
+    repo = _make_repo({
+        "README.md": (
+            "# My App\n\n"
+            "## Install\n\n"
+            "    pip install -r requirements.txt\n\n"
+            "## Run\n\n"
+            "    python main.py\n"
+        ),
+    })
+    claims = extract_claims(repo)
+    claim_types = {c.claim_type for c in claims}
+    assert "install_python" in claim_types, f"Expected install_python, got {claim_types}"
+    assert "run_python" in claim_types, f"Expected run_python, got {claim_types}"
+    print("[OK] extract_claims: install + run commands extracted")
+
+
+def test_extract_claims_framework():
+    """Extract framework claims."""
+    repo = _make_repo({
+        "README.md": "A web app built with Flask.\nUses Express for the API.\n",
+    })
+    claims = extract_claims(repo)
+    framework_claims = [c for c in claims if c.claim_type == "framework"]
+    assert len(framework_claims) >= 2, f"Expected 2 framework claims, got {len(framework_claims)}"
+    frameworks = {c.expected for c in framework_claims}
+    assert "flask" in frameworks
+    assert "express" in frameworks
+    print("[OK] extract_claims: framework claims extracted (flask, express)")
+
+
+def test_extract_claims_file_type():
+    """Extract file processing claims."""
+    repo = _make_repo({
+        "README.md": "Processes CSV files and exports JSON files.\n",
+    })
+    claims = extract_claims(repo)
+    file_claims = [c for c in claims if c.claim_type == "file_type"]
+    assert len(file_claims) >= 2, f"Expected 2 file_type claims, got {len(file_claims)}"
+    exts = {c.expected for c in file_claims}
+    assert "csv" in exts
+    assert "json" in exts
+    print("[OK] extract_claims: file type claims extracted (csv, json)")
+
+
+def test_extract_claims_no_readme():
+    """No README → empty claims list."""
+    repo = _make_repo({"main.py": "print('hi')"})
+    claims = extract_claims(repo)
+    assert claims == []
+    print("[OK] extract_claims: no README → empty claims")
+
+
+def test_match_claim_port_verified():
+    """A port claim is VERIFIED when strace shows a bind() on that port."""
+    repo = _make_repo({"README.md": "Server starts on port 3000.\n"})
+    claims = extract_claims(repo)
+    report = BehaviorReport(ports_bound=["3000"], strace_enabled=True)
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(name="Python", image="", install_cmd=[], run_candidates=[[]])
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    port_match = [m for m in matches if m.claim.claim_type == "port"][0]
+    assert port_match.status == "VERIFIED", \
+        f"Port 3000 with bind() should be VERIFIED, got {port_match.status}"
+    print("[OK] match_claims: port claim VERIFIED when bind() observed")
+
+
+def test_match_claim_port_unverified():
+    """A port claim is UNVERIFIED when no bind() or output mentions it."""
+    repo = _make_repo({"README.md": "Server starts on port 3000.\n"})
+    claims = extract_claims(repo)
+    report = BehaviorReport(ports_bound=["5000"], strace_enabled=True)  # Different port
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(name="Python", image="", install_cmd=[], run_candidates=[[]])
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    port_match = [m for m in matches if m.claim.claim_type == "port"][0]
+    assert port_match.status == "UNVERIFIED", \
+        f"Port 3000 without bind() should be UNVERIFIED, got {port_match.status}"
+    print("[OK] match_claims: port claim UNVERIFIED when no bind() observed")
+
+
+def test_match_claim_install_verified():
+    """An install claim is VERIFIED when the stack's install_cmd matches."""
+    repo = _make_repo({"README.md": "    pip install -r requirements.txt\n"})
+    claims = extract_claims(repo)
+    report = BehaviorReport(strace_enabled=True)
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(
+        name="Python", image="",
+        install_cmd=["pip", "install", "-r", "requirements.txt"],
+        run_candidates=[["python", "main.py"]],
+    )
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    install_match = [m for m in matches if m.claim.claim_type == "install_python"][0]
+    assert install_match.status == "VERIFIED", \
+        f"pip install should be VERIFIED, got {install_match.status}"
+    print("[OK] match_claims: install claim VERIFIED when command matches")
+
+
+def test_match_claim_service_verified():
+    """A service claim is VERIFIED when network attempt to its port is seen."""
+    repo = _make_repo({"README.md": "Connects to PostgreSQL.\n"})
+    claims = extract_claims(repo)
+    report = BehaviorReport(
+        network_attempts=["connect 127.0.0.1:5432"],
+        strace_enabled=True,
+    )
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(name="Python", image="", install_cmd=[], run_candidates=[[]])
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    service_match = [m for m in matches if m.claim.claim_type == "service"][0]
+    assert service_match.status == "VERIFIED", \
+        f"PostgreSQL with connect to 5432 should be VERIFIED, got {service_match.status}"
+    print("[OK] match_claims: service claim VERIFIED when connect to port observed")
+
+
+def test_match_claim_service_unverified():
+    """A service claim is UNVERIFIED when no connect to its port is seen."""
+    repo = _make_repo({"README.md": "Connects to PostgreSQL.\n"})
+    claims = extract_claims(repo)
+    report = BehaviorReport(network_attempts=[], strace_enabled=True)
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(name="Python", image="", install_cmd=[], run_candidates=[[]])
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    service_match = [m for m in matches if m.claim.claim_type == "service"][0]
+    assert service_match.status == "UNVERIFIED", \
+        f"PostgreSQL with no connect should be UNVERIFIED, got {service_match.status}"
+    print("[OK] match_claims: service claim UNVERIFIED when no connect observed")
+
+
+def test_match_claim_framework_verified_via_deps():
+    """A framework claim is VERIFIED when the framework is in requirements.txt."""
+    repo = _make_repo({
+        "README.md": "Built with Flask.\n",
+        "requirements.txt": "flask==3.0.0\n",
+    })
+    claims = extract_claims(repo)
+    report = BehaviorReport(strace_enabled=True)
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(
+        name="Python", image="",
+        install_cmd=["pip", "install"],
+        run_candidates=[["python", "main.py"]],
+    )
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    fw_match = [m for m in matches if m.claim.claim_type == "framework"][0]
+    assert fw_match.status == "VERIFIED", \
+        f"Flask in requirements.txt should be VERIFIED, got {fw_match.status}"
+    print("[OK] match_claims: framework claim VERIFIED via requirements.txt")
+
+
+def test_parse_strace_bind_port():
+    """strace bind() syscalls should be parsed into ports_bound."""
+    d = Path(tempfile.mkdtemp(prefix="trace-bind-"))
+    _write_trace(d, "trace.100", [
+        'execve("/usr/local/bin/python3", ["python3", "main.py"], ...) = 0',
+        'bind(3, {sa_family=AF_INET, sin_port=htons(3000), sin_addr=inet_addr("0.0.0.0")}, 16) = 0',
+        'bind(4, {sa_family=AF_INET6, sin6_port=htons(8080), inet_pton(AF_INET6, "::", &sin6_addr)}, 28) = 0',
+        '+++ exited with 0 +++',
+    ])
+    r = parse_strace_output(d)
+    assert "3000" in r.ports_bound, f"Expected port 3000 in ports_bound, got {r.ports_bound}"
+    assert "8080" in r.ports_bound, f"Expected port 8080 in ports_bound, got {r.ports_bound}"
+    print("[OK] parse_strace_output: bind() ports captured (3000, 8080)")
+
+
+# ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
 
@@ -1597,6 +1808,24 @@ def run_all():
     test_parse_no_duplicate_from_bare_trace_file()
     test_parse_bare_trace_fallback()
     test_behavior_report_has_data_property()
+
+    print()
+    print("=" * 60)
+    print("README Claim Verification tests")
+    print("=" * 60)
+    test_extract_claims_port()
+    test_extract_claims_service()
+    test_extract_claims_install_and_run()
+    test_extract_claims_framework()
+    test_extract_claims_file_type()
+    test_extract_claims_no_readme()
+    test_match_claim_port_verified()
+    test_match_claim_port_unverified()
+    test_match_claim_install_verified()
+    test_match_claim_service_verified()
+    test_match_claim_service_unverified()
+    test_match_claim_framework_verified_via_deps()
+    test_parse_strace_bind_port()
 
     print()
     print("=" * 60)
