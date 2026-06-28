@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.7"
+__version__ = "0.5.8"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -127,6 +127,8 @@ NOT_FOUND_MARKERS = [
     "missing command",       # Multi-command CLI (fastapi, django) needs a subcommand
     "missing script",        # npm Missing script: start
     "no module named",       # Python ImportError
+    "could not find a default file",  # FastAPI: no app file in the repo
+    "please provide an explicit path", # FastAPI: needs an app path
 ]
 
 # ----------------------------------------------------------------------
@@ -2129,9 +2131,41 @@ def analyze_result(
             monorepo=True,
         )
 
-    warnings: list[str] = []
+    # ---- Framework, not app case ----
+    # FastAPI, Django, Flask, etc. are frameworks — they start a server
+    # but need an app file (main.py with an app instance) to actually
+    # serve. When the repo is the framework itself (not an app built
+    # with it), the CLI starts, searches for an app file, and exits
+    # with "Could not find a default file" or "provide an explicit path."
+    # This is NOT a crash — the code ran fine, it just couldn't find
+    # an app to serve. Yellow, not red.
     combined = result.stdout + "\n" + result.stderr
     combined_lower = combined.lower()
+    framework_markers = [
+        "could not find a default file",
+        "please provide an explicit path",
+        "no application file found",
+        "could not find app",
+    ]
+    if any(marker in combined_lower for marker in framework_markers):
+        return Verdict(
+            boots=False,
+            network_egress_blocked=True,
+            filesystem_read_only=True,
+            stdout_preview=result.stdout[:MAX_STDOUT_CHARS],
+            stderr_preview=result.stderr[:MAX_STDERR_CHARS],
+            warnings=[
+                "This repo is a framework/library, not a standalone app. "
+                "The CLI loaded successfully but couldn't find an app "
+                "file (e.g. main.py with an app instance) to run. "
+                "To verify: create a minimal app file and re-run."
+            ],
+            detail="framework loaded but no app file found (create main.py with an app instance to run)",
+            no_entrypoint=True,
+        )
+
+    warnings: list[str] = []
+    # combined and combined_lower were already set above (framework check)
 
     # Network-error detection (unchanged — still deterministic regex).
     network_blocked = bool(NETWORK_ERROR_RE.search(combined))

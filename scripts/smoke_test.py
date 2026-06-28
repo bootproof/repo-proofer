@@ -796,6 +796,34 @@ def test_analyze_missing_script_not_crash():
     print("[OK] analyze_result: Missing script -> 'no runnable entrypoint' (not 'crash')")
 
 
+def test_analyze_framework_no_app_file():
+    """FastAPI starts its dev server but exits because no app file is found.
+    This is NOT a crash — the framework loaded successfully, it just
+    couldn't find a main.py with an app instance. Yellow, not red."""
+    r = ExecutionResult(
+        stdout=(
+            "\n   FastAPI   Starting development server 🚀\n\n"
+            "             Searching for package file structure from directories with\n"
+            "             __init__.py files\n\n"
+            "             Could not find a default file to run, please provide an\n"
+            "             explicit path\n"
+        ),
+        stderr="",
+        exit_code=1,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert v.no_entrypoint is True, \
+        f"Framework with no app file should be yellow (no_entrypoint=True), got detail={v.detail}"
+    assert "framework" in v.detail.lower(), \
+        f"Should say 'framework' in detail, got {v.detail}"
+    assert "crash" not in v.detail.lower(), \
+        f"Framework no-app-file is NOT a crash, got {v.detail}"
+    assert any("framework" in w.lower() or "app file" in w.lower() for w in v.warnings), \
+        f"Should have actionable warning, got {v.warnings}"
+    print("[OK] analyze_result: framework no-app-file -> yellow with actionable guidance")
+
+
 def test_analyze_network_error_node():
     r = ExecutionResult(
         stdout="",
@@ -1905,6 +1933,7 @@ def run_all():
     test_analyze_install_failure_leads_on_non_127_exit()
     test_analyze_exit_127_no_command_extracted()
     test_analyze_missing_script_not_crash()
+    test_analyze_framework_no_app_file()
     test_analyze_network_error_node()
     test_analyze_network_error_python()
     test_analyze_timeout_long_running()
