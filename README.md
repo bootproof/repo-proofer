@@ -15,11 +15,11 @@ If a repo can't boot without internet, that's not a tool failure — that's a su
 
 ---
 
-## The moat
+## The Solution
 
 `--network none` and `--read-only` are mandatory on every execution. Static analysis (Snyk, Socket, GitHub Advanced Security) reads code to see if it *looks* malicious. `repo-proofer` actually runs it in a locked box and watches what it *does*. Obfuscation can fool a linter. It cannot fool a kernel that refuses to open a socket.
 
-If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdict escalates to `BOOTS: NO` even if the process exited cleanly. **That's the enterprise hook.**
+If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdict escalates to `BOOTS: NO` even if the process exited cleanly. 
 
 ---
 
