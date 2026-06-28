@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -297,20 +297,29 @@ console = Console()
 def _extract_missing_command(stderr: str) -> Optional[str]:
     """Extract the missing command name from a 'command not found' stderr.
 
-    Handles common patterns:
-      sh: 1: turbo: not found
-      bash: turbo: command not found
-      /bin/sh: turbo: not found
-      node: command not found
-    Returns the command name (e.g. "turbo") or None.
+    Handles common patterns across stacks:
+      sh: 1: turbo: not found              (sh/dash — Node/turbo formbricks case)
+      bash: turbo: command not found       (bash)
+      bundler: command not found: rails    (bundler — Ruby/gitlab case)
+      rails: command not found             (generic)
+    Returns the command name (e.g. "turbo", "rails") or None.
     """
-    # Pattern: <shell>: <line>: <cmd>: not found  OR  <cmd>: command not found
+    # Pattern 1: <shell>: <line>: <cmd>: not found  (sh/dash)
     m = re.search(r'(?:sh|bash|/bin/sh|dash):\s*\d+:\s*([^:]+):\s*(?:not found|command not found)',
                   stderr, re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # Fallback: "<cmd>: command not found"
+    # Pattern 2: bundler: command not found: <cmd>  (Ruby/bundler — the
+    # command name comes AFTER "command not found", not before)
+    m = re.search(r'bundler:\s*command not found:\s*(\S+)', stderr, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Pattern 3: <cmd>: command not found  (generic, cmd at start of line)
     m = re.search(r'^([^:\s]+):\s*command not found', stderr, re.IGNORECASE | re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    # Pattern 4: <cmd>: not found  (shorthand, no "command")
+    m = re.search(r'^([^:\s]+):\s*not found', stderr, re.IGNORECASE | re.MULTILINE)
     if m:
         return m.group(1).strip()
     return None
@@ -1496,7 +1505,10 @@ def execute_entrypoint(
 # Analysis — deterministic, regex-based
 # ----------------------------------------------------------------------
 
-def analyze_result(result: ExecutionResult) -> Verdict:
+def analyze_result(
+    result: ExecutionResult,
+    install_result: Optional[ExecutionResult] = None,
+) -> Verdict:
     """Produce a verdict from the execution result. 100% deterministic.
 
     BOOTS semantics (readiness-aware, not just exit-code-aware):
@@ -1509,6 +1521,12 @@ def analyze_result(result: ExecutionResult) -> Verdict:
                                                      no crash detected)")
       timed out, crash signature     -> BOOTS: NO   ("crashed before timeout")
       timed out + readiness signal   -> BOOTS: YES  ("server detected: <signal>")
+      install failed + 127 exec      -> BOOTS: NO   ("could not start: install
+                                                    failed (exit N), <cmd>
+                                                    unavailable")
+      exit 127 (command not found)   -> BOOTS: NO   ("failed to start: <cmd>
+                                                    not found (missing dep)")
+      missing script                 -> BOOTS: NO   ("no runnable entrypoint")
       non-zero exit, not timeout     -> BOOTS: NO   ("exited <code> (crash)")
 
     The previous logic (`boots = exit_code == 0`) marked every server,
@@ -1635,7 +1653,31 @@ def analyze_result(result: ExecutionResult) -> Verdict:
         #   Any other non-zero = genuine application crash (traceback,
         #         segfault, panic, exit 1 from running code).
         boots = False
-        if result.exit_code == 127:
+        # ---- Install-failure-first check ----
+        # When install failed AND execution fails with 127 (command not
+        # found), the install failure is the ROOT CAUSE — the 127 is just
+        # its shadow. The command wasn't found because it was never
+        # installed. Lead with the install failure, not the downstream
+        # exit code. (The GitLab case: bundle install failed → rails
+        # never installed → exit 127. The honest verdict leads with
+        # "install failed", not "crash" or even "command not found".)
+        if (install_result is not None
+                and install_result.exit_code != 0
+                and result.exit_code == 127):
+            missing_cmd = _extract_missing_command(result.stderr)
+            cmd_part = f", '{missing_cmd}' unavailable" if missing_cmd else ""
+            detail = (
+                f"could not start: install failed (exit {install_result.exit_code})"
+                f"{cmd_part}"
+            )
+            warnings.append(
+                "The install step failed, so required tools were never "
+                "installed. This is an environment failure — the repo's "
+                "code never ran. Check the Install Warning panel for the "
+                "install error."
+            )
+        # ---- 127 without install failure ----
+        elif result.exit_code == 127:
             # Command not found — environment/dependency failure.
             # Try to extract the missing command from stderr for detail.
             missing_cmd = _extract_missing_command(result.stderr)
@@ -2251,7 +2293,7 @@ def main(
                 )
 
         # ---- Step 5: Analyze ----------------------------------------
-        verdict = analyze_result(exec_result)
+        verdict = analyze_result(exec_result, install_result)
 
         # ---- Step 5b: Parse strace trace (if enabled) --------------
         behavior_report = BehaviorReport()

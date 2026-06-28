@@ -624,7 +624,64 @@ def test_analyze_exit_127_command_not_found():
         f"Exit 127 is NOT a crash — don't use that word, got {v.detail}"
     assert any("environment failure" in w for w in v.warnings), \
         f"Should warn about environment failure, got {v.warnings}"
-    print("[OK] analyze_result: exit 127 -> 'failed to start' (not 'crash')")
+    print("[OK] analyze_result: exit 127 (turbo) -> 'failed to start' (not 'crash')")
+
+
+def test_analyze_exit_127_bundler_command_not_found():
+    """Exit 127 with bundler's format: 'bundler: command not found: rails'.
+    The command name comes AFTER 'command not found', not before — the
+    old regex missed this and gitlab fell through to the generic label.
+    This is the GitLab case: bundle install failed → rails never installed
+    → bundler couldn't find rails → exit 127.
+    """
+    r = ExecutionResult(
+        stdout="",
+        stderr="bundler: command not found: rails",
+        exit_code=127,
+    )
+    v = analyze_result(r)
+    assert v.boots is False
+    assert "failed to start" in v.detail, \
+        f"Exit 127 should say 'failed to start', got {v.detail}"
+    assert "rails" in v.detail, \
+        f"Should extract missing command 'rails' from bundler format, got {v.detail}"
+    assert "crash" not in v.detail.lower(), \
+        f"Exit 127 is NOT a crash, got {v.detail}"
+    print("[OK] analyze_result: exit 127 (bundler: rails) -> 'failed to start'")
+
+
+def test_analyze_install_failure_leads_verdict():
+    """When install failed AND execution fails with 127, the install
+    failure is the ROOT CAUSE. The verdict should lead with 'install
+    failed', not 'command not found' or 'crash'.
+
+    The GitLab case: bundle install failed (exit 15) → rails never
+    installed → exit 127. The honest verdict leads with the install
+    failure, because that's what actually went wrong.
+    """
+    install_result = ExecutionResult(
+        stdout="",
+        stderr="ERROR: --path flag is deprecated",
+        exit_code=15,
+    )
+    exec_result = ExecutionResult(
+        stdout="",
+        stderr="bundler: command not found: rails",
+        exit_code=127,
+    )
+    v = analyze_result(exec_result, install_result=install_result)
+    assert v.boots is False
+    assert "install failed" in v.detail, \
+        f"Install-failure-first: should lead with 'install failed', got {v.detail}"
+    assert "exit 15" in v.detail, \
+        f"Should include install exit code, got {v.detail}"
+    assert "rails" in v.detail, \
+        f"Should include the unavailable command, got {v.detail}"
+    assert "crash" not in v.detail.lower(), \
+        f"Install failure is NOT a crash, got {v.detail}"
+    assert any("environment failure" in w for w in v.warnings), \
+        f"Should warn about environment failure, got {v.warnings}"
+    print("[OK] analyze_result: install failure + 127 -> leads with 'install failed'")
 
 
 def test_analyze_exit_127_no_command_extracted():
@@ -1460,6 +1517,8 @@ def run_all():
     test_analyze_monorepo_no_root_entry()
     test_analyze_boots_no()
     test_analyze_exit_127_command_not_found()
+    test_analyze_exit_127_bundler_command_not_found()
+    test_analyze_install_failure_leads_verdict()
     test_analyze_exit_127_no_command_extracted()
     test_analyze_missing_script_not_crash()
     test_analyze_network_error_node()
