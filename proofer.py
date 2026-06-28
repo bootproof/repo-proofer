@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -841,6 +841,74 @@ def _detect_node_workspaces(repo_path: Path) -> Optional[list[str]]:
     return None
 
 
+def _extract_pyproject_deps(pyproject_path: Path) -> list[str]:
+    """Extract the dependency list from pyproject.toml. Runs on the HOST
+    (not inside Docker) to avoid inline Python quoting issues.
+
+    Handles:
+      - PEP 621: [project.dependencies]
+      - Poetry: [tool.poetry.dependencies] (filters out 'python' key)
+      - Optional deps: [project.optional-dependencies]
+
+    Returns a list of pip-installable requirement strings.
+    """
+    try:
+        text = pyproject_path.read_text()
+    except OSError:
+        return []
+
+    # Try tomllib (3.11+) or tomli (3.10)
+    data = None
+    try:
+        import tomllib
+        data = tomllib.loads(text)
+    except ImportError:
+        try:
+            import tomli
+            data = tomli.loads(text)
+        except ImportError:
+            pass
+
+    if data is None:
+        # Regex fallback — extract lines that look like deps
+        # from [project.dependencies] section
+        deps: list[str] = []
+        in_deps = False
+        for line in text.splitlines():
+            if line.strip() == "[project.dependencies]":
+                in_deps = True
+                continue
+            if line.strip().startswith("[") and in_deps:
+                break  # Next section
+            if in_deps and line.strip() and not line.strip().startswith("#"):
+                # Strip quotes and whitespace
+                dep = line.strip().strip('"').strip("'")
+                if dep:
+                    deps.append(dep)
+        return deps
+
+    deps = []
+
+    # PEP 621: [project.dependencies]
+    project_deps = data.get("project", {}).get("dependencies", [])
+    if isinstance(project_deps, list):
+        deps.extend(project_deps)
+
+    # Poetry: [tool.poetry.dependencies]
+    poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+    if isinstance(poetry_deps, dict):
+        for name, version in poetry_deps.items():
+            if name.lower() == "python":
+                continue  # Skip the python version constraint
+            if isinstance(version, str):
+                deps.append(f"{name}{version}")
+            elif isinstance(version, dict):
+                # Poetry table format — just use the name
+                deps.append(name)
+
+    return deps
+
+
 def _detect_node_entrypoints(repo_path: Path) -> list[list[str]]:
     """Read package.json to pick entrypoints deterministically.
 
@@ -1206,38 +1274,43 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
                 "-t", "/tmp/pip_deps",
             ]
         elif (repo_path / "pyproject.toml").exists():
-            # No requirements.txt, but pyproject.toml exists (FastAPI,
-            # modern Python projects). Extract the dependency list from
-            # pyproject.toml and install ONLY the dependencies to
-            # /tmp/pip_deps — NOT the package itself.
-            #
-            # Why not `pip install . -t /tmp/pip_deps`? Because that
-            # installs the package to /tmp/pip_deps, but the source
-            # checkout at /app/fastapi/ shadows it (cwd is on sys.path
-            # before PYTHONPATH). The source version's CLI then checks
-            # importlib.metadata, fails to find a "proper" install, and
-            # raises RuntimeError("please install fastapi"). By installing
-            # ONLY the deps and leaving the source as the package, we
-            # avoid the shadowing conflict entirely.
-            install_cmd = [
-                "sh", "-c",
-                # Try tomllib (3.11+) or tomli (3.10) to extract deps.
-                # Fall back to `pip install .` if parsing fails.
-                "python3 -c \""
-                "try:"
-                "  import tomllib as t;"
-                "except ImportError:"
-                "  import tomli as t;"
-                "d=t.loads(open('pyproject.toml','rb').read().decode());"
-                "deps=d.get('project',{}).get('dependencies',[]) or d.get('tool',{}).get('poetry',{}).get('dependencies',{});"
-                "deps=[k if isinstance(k,str) else k for k in (deps if isinstance(deps,list) else deps.keys())] if deps else [];"
-                "open('/tmp/deps.txt','w').write('\\n'.join(deps))"
-                "\" "
-                "&& pip install --no-cache-dir --prefer-binary "
-                "-t /tmp/pip_deps -r /tmp/deps.txt "
-                "|| pip install --no-cache-dir --prefer-binary "
-                "-t /tmp/pip_deps .",
-            ]
+            # Extract dependencies from pyproject.toml ON THE HOST (not
+            # inside Docker — avoids inline Python quoting hell). Write
+            # them to a requirements-style file in the repo dir so Docker
+            # can read it. Then install ONLY the deps, not the package
+            # itself, to avoid the source-vs-installed shadowing conflict
+            # (the FastAPI RuntimeError fix).
+            deps = _extract_pyproject_deps(repo_path / "pyproject.toml")
+            if deps:
+                # Write deps to a temp file in the repo (mounted :ro in
+                # Docker, but we write it BEFORE Docker runs — the mount
+                # picks it up).
+                deps_file = repo_path / ".repo-proofer-deps.txt"
+                try:
+                    deps_file.write_text("\n".join(deps) + "\n")
+                except OSError:
+                    deps_file = None
+
+                if deps_file:
+                    install_cmd = [
+                        "pip", "install", "--no-cache-dir", "--prefer-binary",
+                        "-r", ".repo-proofer-deps.txt",
+                        "-t", "/tmp/pip_deps",
+                    ]
+                else:
+                    # Couldn't write the file — fall back
+                    install_cmd = [
+                        "sh", "-c",
+                        "pip install --no-cache-dir --prefer-binary "
+                        "-t /tmp/pip_deps .",
+                    ]
+            else:
+                # No deps extracted — fall back to installing the package
+                install_cmd = [
+                    "sh", "-c",
+                    "pip install --no-cache-dir --prefer-binary "
+                    "-t /tmp/pip_deps .",
+                ]
         elif (repo_path / "setup.py").exists() or (repo_path / "setup.cfg").exists():
             # Legacy setup.py/setup.cfg — install the project which reads
             # install_requires from setup.py/setup.cfg.
