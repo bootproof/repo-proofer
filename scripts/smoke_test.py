@@ -1711,6 +1711,100 @@ def test_parse_strace_bind_port():
     print("[OK] parse_strace_output: bind() ports captured (3000, 8080)")
 
 
+def test_extract_claims_buzzwords():
+    """Buzzword claims (quantum, blockchain, AI-powered) should be extracted
+    as 'buzzword' type so they're not silently ignored. Without this, a
+    slop README with 'quantum-enhanced blockchain platform' and 'pip install'
+    would show '1 of 1 claims verified' — misleadingly clean."""
+    repo = _make_repo({
+        "README.md": (
+            "# QuantumGPT-Neo\n\n"
+            "Quantum-Enhanced DevOps platform with Blockchain Audit Trail.\n"
+            "AI-Powered code review and Predictive Auto-Scaling.\n"
+            "Zero-Trust Security and Carbon-Aware scheduling.\n\n"
+            "## Install\n\n"
+            "    pip install -r requirements.txt\n"
+        ),
+    })
+    claims = extract_claims(repo)
+    buzzword_claims = [c for c in claims if c.claim_type == "buzzword"]
+    assert len(buzzword_claims) >= 5, \
+        f"Expected 5+ buzzword claims, got {len(buzzword_claims)}: {[c.expected for c in buzzword_claims]}"
+    buzzwords = {c.expected for c in buzzword_claims}
+    assert "quantum" in buzzwords, f"Expected 'quantum' buzzword, got {buzzwords}"
+    assert "blockchain" in buzzwords, f"Expected 'blockchain' buzzword, got {buzzwords}"
+    assert "ai-powered" in buzzwords, f"Expected 'ai-powered' buzzword, got {buzzwords}"
+    # Verify the testable claim is still extracted alongside buzzwords
+    testable = [c for c in claims if c.claim_type != "buzzword"]
+    assert any(c.claim_type == "install_python" for c in testable), \
+        f"Expected install_python alongside buzzwords, got {[c.claim_type for c in testable]}"
+    print(f"[OK] extract_claims: {len(buzzword_claims)} buzzword claims detected (quantum, blockchain, ai-powered, ...)")
+
+
+def test_match_buzzword_claim_unverifiable():
+    """Buzzword claims should always be UNVERIFIABLE — they're marketing
+    terms with no testable runtime behavior."""
+    repo = _make_repo({"README.md": "Quantum-Enhanced platform.\n"})
+    claims = extract_claims(repo)
+    report = BehaviorReport(strace_enabled=True)
+    exec_result = ExecutionResult(stdout="", stderr="", exit_code=0)
+    stack = StackProfile(name="Python", image="", install_cmd=[], run_candidates=[[]])
+    matches = match_claims(claims, report, exec_result, stack, repo)
+    buzzword_matches = [m for m in matches if m.claim.claim_type == "buzzword"]
+    assert buzzword_matches, "Expected at least 1 buzzword match"
+    for m in buzzword_matches:
+        assert m.status == "UNVERIFIABLE", \
+            f"Buzzword '{m.claim.expected}' should be UNVERIFIABLE, got {m.status}"
+    print("[OK] match_claims: buzzword claims -> UNVERIFIABLE (marketing terms)")
+
+
+def test_slop_fixture_claims():
+    """The slop fixture README should produce both testable claims (install,
+    run) AND buzzword claims (quantum, blockchain, etc.). This is the A/B
+    that proves the tool doesn't say 'all verified' when the README is slop."""
+    # Use the actual slop fixture from the repo
+    slop_readme = (
+        "# 🚀 QuantumGPT-Neo — Next-Gen AI-Powered DevOps Orchestration Platform\n\n"
+        "> The world's first quantum-enhanced, blockchain-secured, AI-driven DevOps\n"
+        "> orchestration platform with built-in sentiment analysis and predictive\n"
+        "> auto-scaling.\n\n"
+        "## ✨ Features\n\n"
+        "- 🧠 GPT-5 Powered Code Review\n"
+        "- ⚛️ Quantum-Enhanced Scheduling\n"
+        "- 🔒 Blockchain Audit Trail\n"
+        "- Zero-Trust Security\n"
+        "- Carbon-Aware\n"
+        "- Self-Healing\n\n"
+        "## 📦 Installation\n\n"
+        "    pip install -r requirements.txt\n\n"
+        "## 🏃 Quick Start\n\n"
+        "    python main.py\n"
+    )
+    repo = _make_repo({"README.md": slop_readme})
+    claims = extract_claims(repo)
+    buzzword_claims = [c for c in claims if c.claim_type == "buzzword"]
+    testable_claims = [c for c in claims if c.claim_type != "buzzword"]
+
+    # Must have buzzword claims (quantum, blockchain, etc.)
+    assert len(buzzword_claims) >= 4, \
+        f"Expected 4+ buzzword claims from slop README, got {len(buzzword_claims)}: " \
+        f"{[c.expected for c in buzzword_claims]}"
+
+    # Must also have testable claims (install, run)
+    assert len(testable_claims) >= 2, \
+        f"Expected 2+ testable claims, got {len(testable_claims)}"
+
+    # The key assertion: testable claims are a MINORITY of total claims.
+    # This is what makes the slop fixture read honestly: "2 of 2 testable
+    # verified (6 buzzword claims not machine-verifiable)" instead of
+    # the old misleading "2 of 2 verified."
+    assert len(testable_claims) < len(claims), \
+        f"Testable claims should be < total claims (buzzwords exist)"
+
+    print(f"[OK] extract_claims: slop fixture → {len(testable_claims)} testable + "
+          f"{len(buzzword_claims)} buzzword claims (honest coverage)")
+
+
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
@@ -1826,6 +1920,9 @@ def run_all():
     test_match_claim_service_unverified()
     test_match_claim_framework_verified_via_deps()
     test_parse_strace_bind_port()
+    test_extract_claims_buzzwords()
+    test_match_buzzword_claim_unverifiable()
+    test_slop_fixture_claims()
 
     print()
     print("=" * 60)

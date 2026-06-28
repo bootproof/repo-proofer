@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
@@ -503,6 +503,27 @@ SERVICE_PORTS = {
     "supabase": "5432",  # Supabase uses Postgres
 }
 
+# Buzzword patterns — common AI-slop claims that can't be verified by
+# execution. These are flagged as UNVERIFIABLE so the report doesn't
+# silently ignore them (which would make "2 of 2 verified" misleading
+# when the README also claims "quantum-enhanced" and "blockchain-secured").
+#
+# Each entry is (pattern, label) — the label is displayed to the user.
+SLOP_BUZZWORDS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'quantum[- ]?(?:enhanced|powered|computing|scheduler|ready)', re.IGNORECASE), "quantum"),
+    (re.compile(r'blockchain[- ]?(?:secured|audit|powered|based|trail|ledger)', re.IGNORECASE), "blockchain"),
+    (re.compile(r'ai[- ]?(?:powered|driven|enhanced|assisted)', re.IGNORECASE), "ai-powered"),
+    (re.compile(r'(?:next[- ]?gen|next[- ]?generation|cutting[- ]?edge|revolutionary|game[- ]?changing)', re.IGNORECASE), "marketing-speak"),
+    (re.compile(r'(?:predictive|proactive)\s+(?:auto[- ]?scal|schedul|analy|insight)', re.IGNORECASE), "predictive-ai"),
+    (re.compile(r'(?:zero[- ]?trust|military[- ]?grade|enterprise[- ]?grade)\s+security', re.IGNORECASE), "security-buzzword"),
+    (re.compile(r'(?:carbon[- ]?aware|green\s+computing|eco[- ]?friendly)', re.IGNORECASE), "eco-buzzword"),
+    (re.compile(r'(?:self[- ]?healing|auto[- ]?healing|self[- ]?repair)', re.IGNORECASE), "self-healing"),
+    (re.compile(r'(?:edge[- ]?native|edge[- ]?computing|247\s+edge\s+regions)', re.IGNORECASE), "edge-buzzword"),
+    (re.compile(r'(?:5g[- ]?optimized|5g[- ]?ready)', re.IGNORECASE), "5g-buzzword"),
+    (re.compile(r'(?:neural|deep\s+learning|machine\s+learning)\s+(?:powered|driven|engine|scheduler)', re.IGNORECASE), "ml-buzzword"),
+    (re.compile(r'(?:sentiment[- ]?aware|emotion[- ]?aware|cognitive)', re.IGNORECASE), "cognitive-buzzword"),
+]
+
 
 @dataclass
 class Claim:
@@ -522,12 +543,25 @@ class ClaimMatch:
 
 
 def extract_claims(repo_path: Path) -> list[Claim]:
-    """Extract testable claims from the README. 100% deterministic.
+    """Extract testable claims AND buzzword claims from the README.
 
-    Reads README.md (or README.rst, README.txt, README) and applies
-    regex patterns to find testable assertions. No LLMs, no AI — just
-    regex. This means we'll miss nuanced claims, but every claim we
-    extract is checkable and the extraction is reproducible.
+    100% deterministic — no LLMs, no AI. Two categories of claim are
+    extracted:
+
+    1. TESTABLE claims (ports, services, frameworks, install commands,
+       file types) — these can be matched against runtime evidence.
+
+    2. BUZZWORD claims (quantum, blockchain, AI-powered, etc.) — these
+       are common AI-slop marketing terms that CANNOT be verified by
+       execution. They're extracted and marked UNVERIFIABLE so the
+       report doesn't silently ignore them. Without this, a README that
+       says "quantum-enhanced blockchain platform" with "pip install"
+       would show "1 of 1 claims verified" — misleadingly clean.
+
+    Also tracks README coverage: how many of the README's lines contain
+    claims we can check, so the user knows whether "all verified" means
+    "the README was thorough and we checked everything" or "the README
+    was 500 lines but we only found 2 checkable claims."
     """
     # Find the README file
     readme_path: Optional[Path] = None
@@ -550,27 +584,40 @@ def extract_claims(repo_path: Path) -> list[Claim]:
     seen: set[tuple[str, str]] = set()  # Dedup by (claim_type, expected)
 
     for line_num, line in enumerate(text.splitlines(), 1):
+        # --- Testable claims (ports, services, frameworks, etc.) ---
         for pattern, claim_type in CLAIM_PATTERNS:
-            # Use finditer to catch ALL matches on a line (e.g., "processes
-            # CSV files and exports JSON files" has two file_type matches).
             for m in pattern.finditer(line):
-                # Some patterns have a capture group (port, service, etc),
-                # others don't (install_python, run_npm_start). Handle both.
                 try:
                     expected = m.group(1).lower().rstrip(".")
                 except IndexError:
-                    expected = claim_type  # No capture group — use the type
-                # Dedup — don't extract the same claim multiple times
+                    expected = claim_type
                 key = (claim_type, expected)
                 if key in seen:
                     continue
                 seen.add(key)
-                # Trim the claim text to a reasonable length
                 claim_text = line.strip()[:120]
                 claims.append(Claim(
                     text=claim_text,
                     claim_type=claim_type,
                     expected=expected,
+                    source_line=line_num,
+                ))
+
+        # --- Buzzword claims (quantum, blockchain, AI-powered, etc.) ---
+        # These are extracted as "buzzword" type and always match as
+        # UNVERIFIABLE — they're marketing terms, not testable assertions.
+        for pattern, label in SLOP_BUZZWORDS:
+            m = pattern.search(line)
+            if m:
+                key = ("buzzword", label)
+                if key in seen:
+                    continue
+                seen.add(key)
+                claim_text = line.strip()[:120]
+                claims.append(Claim(
+                    text=claim_text,
+                    claim_type="buzzword",
+                    expected=label,
                     source_line=line_num,
                 ))
 
@@ -742,6 +789,16 @@ def _match_single_claim(
                 pass
         return ClaimMatch(claim, "UNVERIFIED",
                           f"No evidence of {framework} in strace or deps")
+
+    elif claim.claim_type == "buzzword":
+        # Buzzword claims (quantum, blockchain, AI-powered, etc.) are
+        # ALWAYS unverifiable — they're marketing terms with no
+        # testable runtime behavior. Flag them so the report shows
+        # the gap honestly, e.g. "2 of 2 testable claims verified,
+        # 5 buzzword claims not machine-verifiable."
+        return ClaimMatch(claim, "UNVERIFIABLE",
+                          f"'{claim.expected}' is a marketing claim — "
+                          f"cannot be verified by execution")
 
     return ClaimMatch(claim, "UNVERIFIABLE",
                       f"Unknown claim type: {claim.claim_type}")
@@ -2435,28 +2492,66 @@ def print_claim_report(matches: list[ClaimMatch]) -> None:
     verified = [m for m in matches if m.status == "VERIFIED"]
     unverified = [m for m in matches if m.status == "UNVERIFIED"]
     unverifiable = [m for m in matches if m.status == "UNVERIFIABLE"]
+
+    # Split unverifiable into buzzword claims vs genuinely-unverifiable
+    # testable claims. Buzzword claims (quantum, blockchain, AI-powered)
+    # get their own section so they don't inflate the "testable" count.
+    buzzword_matches = [m for m in unverifiable if m.claim.claim_type == "buzzword"]
+    genuinely_unverifiable = [m for m in unverifiable if m.claim.claim_type != "buzzword"]
+
+    # Testable claims = verified + unverified + genuinely_unverifiable
+    # (buzzword claims are NOT testable — they're marketing terms)
+    testable = verified + unverified + genuinely_unverifiable
+    testable_total = len(testable)
     total = len(matches)
 
     # Summary table
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="bold cyan", no_wrap=True)
     table.add_column()
-    table.add_row("Claims Verified", f"[bold green]{len(verified)}[/bold green] of {total}")
+    if testable_total > 0:
+        table.add_row("Claims Verified",
+                      f"[bold green]{len(verified)}[/bold green] of {testable_total} testable")
+    else:
+        table.add_row("Claims Verified", "[dim]0 (no testable claims found)[/dim]")
     if unverified:
         table.add_row("Claims Unverified", f"[yellow]{len(unverified)}[/yellow]")
-    if unverifiable:
-        table.add_row("Claims Unverifiable", f"[dim]{len(unverifiable)}[/dim]")
+    if buzzword_matches:
+        table.add_row("Buzzword Claims",
+                      f"[magenta]{len(buzzword_matches)}[/magenta] (not machine-verifiable)")
+    if genuinely_unverifiable:
+        table.add_row("Claims Unverifiable", f"[dim]{len(genuinely_unverifiable)}[/dim]")
 
-    # The headline: what percentage of claims were backed by execution?
-    pct = (len(verified) / total * 100) if total > 0 else 0
-    if pct == 100:
-        verdict_line = f"[bold green]All {total} README claims verified by execution.[/bold green]"
-    elif pct >= 50:
-        verdict_line = f"[yellow]{len(verified)} of {total} claims verified — some claims not observed in execution.[/yellow]"
-    elif pct > 0:
-        verdict_line = f"[bold red]{len(verified)} of {total} claims verified — most claims NOT observed in execution. Possible slop.[/bold red]"
+    # The headline: honest about coverage. "2 of 2 testable verified"
+    # is different from "2 of 2 verified" when there are also 5 buzzwords.
+    if testable_total == 0 and buzzword_matches:
+        verdict_line = (
+            f"[bold red]0 testable claims found, {len(buzzword_matches)} "
+            f"buzzword claims detected. README makes marketing claims "
+            f"with no verifiable technical assertions. Likely slop.[/bold red]"
+        )
+    elif testable_total > 0:
+        pct = (len(verified) / testable_total * 100) if testable_total > 0 else 0
+        buzzword_note = ""
+        if buzzword_matches:
+            buzzword_note = (f" ({len(buzzword_matches)} buzzword claim"
+                             f"{'s' if len(buzzword_matches) != 1 else ''} "
+                             f"not machine-verifiable)")
+
+        if pct == 100:
+            verdict_line = (f"[bold green]All {testable_total} testable README "
+                            f"claims verified by execution.{buzzword_note}[/bold green]")
+        elif pct >= 50:
+            verdict_line = (f"[yellow]{len(verified)} of {testable_total} testable "
+                            f"claims verified — some not observed.{buzzword_note}[/yellow]")
+        elif pct > 0:
+            verdict_line = (f"[bold red]{len(verified)} of {testable_total} testable "
+                            f"claims verified — most NOT observed. Possible slop.{buzzword_note}[/bold red]")
+        else:
+            verdict_line = (f"[bold red]0 of {testable_total} testable claims verified — "
+                            f"README does not match execution. Likely slop.{buzzword_note}[/bold red]")
     else:
-        verdict_line = f"[bold red]0 of {total} claims verified — README does not match execution. Likely slop.[/bold red]"
+        verdict_line = "[dim]No testable claims found in README.[/dim]"
 
     console.print(Panel(
         table,
@@ -2489,14 +2584,31 @@ def print_claim_report(matches: list[ClaimMatch]) -> None:
             border_style="yellow",
         ))
 
-    # Unverifiable claims
-    if unverifiable:
+    # Buzzword claims — marketing terms that can't be verified.
+    # This is the section that catches "quantum-enhanced blockchain" slop.
+    if buzzword_matches:
+        console.print(Panel(
+            "\n".join(
+                f"[magenta]~ {m.claim.text}\n"
+                f"  [dim]{m.evidence}[/dim]"
+                for m in buzzword_matches
+            ),
+            title=(
+                f"[magenta]Buzzword Claims ({len(buzzword_matches)})[/magenta]\n"
+                "[dim]Marketing terms — cannot be verified by execution. "
+                "High concentration of these is a slop signal.[/dim]"
+            ),
+            border_style="magenta",
+        ))
+
+    # Genuinely unverifiable claims (not buzzwords)
+    if genuinely_unverifiable:
         console.print(Panel(
             "\n".join(
                 f"[dim]? {m.claim.text}\n  {m.evidence}[/dim]"
-                for m in unverifiable
+                for m in genuinely_unverifiable
             ),
-            title=f"[dim]Unverifiable ({len(unverifiable)})[/dim]",
+            title=f"[dim]Unverifiable ({len(genuinely_unverifiable)})[/dim]",
             border_style="dim",
         ))
 
