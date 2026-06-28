@@ -301,6 +301,140 @@ def test_detect_python_pyproject_no_main():
     print("[OK] detect_stack: Python (pyproject.toml-only, no entrypoint -> still detected)")
 
 
+def test_detect_python_console_scripts_pyproject():
+    """A modern Python CLI that declares its entrypoint ONLY in
+    [project.scripts] (no main.py) should produce a runnable
+    `python -c` candidate. Without this, the CLI would be mislabeled
+    as a library (yellow NO RUNNABLE ENTRYPOINT)."""
+    repo = _make_repo({
+        "pyproject.toml": (
+            '[project]\nname = "mytool"\nversion = "0.1.0"\n'
+            '[project.scripts]\nmytool = "mytool.cli:app"\n'
+        ),
+        "mytool/__init__.py": "",
+        "mytool/cli.py": "def app(): print('hi')",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python"
+    # Should have a python -c candidate that imports mytool.cli and calls app()
+    assert any("-c" in c and "mytool.cli" in " ".join(c) for c in s.run_candidates), \
+        f"Expected python -c with mytool.cli, got {s.run_candidates}"
+    print("[OK] detect_stack: Python ([project.scripts] -> python -c candidate)")
+
+
+def test_detect_python_console_scripts_poetry():
+    """Poetry's [tool.poetry.scripts] format should also be detected."""
+    repo = _make_repo({
+        "pyproject.toml": (
+            '[tool.poetry]\nname = "mytool"\n'
+            '[tool.poetry.scripts]\nmytool = "mytool.cli:app"\n'
+        ),
+        "mytool/__init__.py": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python"
+    assert any("-c" in c for c in s.run_candidates), \
+        f"Expected python -c from Poetry scripts, got {s.run_candidates}"
+    print("[OK] detect_stack: Python ([tool.poetry.scripts] -> python -c)")
+
+
+def test_detect_python_console_scripts_poetry_shorthand():
+    """Poetry shorthand: bare module (no :func) means module:main."""
+    repo = _make_repo({
+        "pyproject.toml": (
+            '[tool.poetry.scripts]\nmytool = "mytool.cli"\n'
+        ),
+        "mytool/__init__.py": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    cmd = [c for c in s.run_candidates if "-c" in c]
+    assert cmd, f"Expected python -c candidate, got {s.run_candidates}"
+    # Shorthand resolves to :main
+    assert "main" in " ".join(cmd[0]), \
+        f"Expected 'main' in Poetry shorthand command, got {cmd[0]}"
+    print("[OK] detect_stack: Python (Poetry shorthand -> module:main)")
+
+
+def test_detect_python_console_scripts_dotted_attr():
+    """Dotted attribute path (pkg.mod:obj.method) should resolve correctly."""
+    repo = _make_repo({
+        "pyproject.toml": (
+            '[project.scripts]\nmytool = "mytool.cli:app.main"\n'
+        ),
+        "mytool/__init__.py": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    cmd = [c for c in s.run_candidates if "-c" in c]
+    assert cmd, f"Expected python -c candidate, got {s.run_candidates}"
+    code = " ".join(cmd[0])
+    assert "getattr(obj, 'app')" in code, f"Expected getattr app, got {code}"
+    assert "getattr(obj, 'main')" in code, f"Expected getattr main, got {code}"
+    print("[OK] detect_stack: Python (dotted attr pkg.mod:obj.method)")
+
+
+def test_detect_python_console_scripts_setup_cfg():
+    """setup.cfg [options.entry_points] console_scripts should be detected."""
+    repo = _make_repo({
+        "setup.cfg": (
+            "[metadata]\nname = mytool\n\n"
+            "[options.entry_points]\nconsole_scripts =\n"
+            "    mytool = mytool.cli:app\n"
+        ),
+        "mytool/__init__.py": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python"
+    assert any("-c" in c for c in s.run_candidates), \
+        f"Expected python -c from setup.cfg, got {s.run_candidates}"
+    print("[OK] detect_stack: Python (setup.cfg console_scripts -> python -c)")
+
+
+def test_detect_python_console_scripts_setup_py():
+    """setup.py entry_points console_scripts should be detected via regex."""
+    repo = _make_repo({
+        "setup.py": (
+            'from setuptools import setup\n'
+            'setup(name="mytool", entry_points={\n'
+            '    "console_scripts": ["mytool = mytool.cli:app"],\n'
+            '})\n'
+        ),
+        "mytool/__init__.py": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    assert s.name == "Python"
+    assert any("-c" in c for c in s.run_candidates), \
+        f"Expected python -c from setup.py, got {s.run_candidates}"
+    print("[OK] detect_stack: Python (setup.py console_scripts -> python -c)")
+
+
+def test_detect_python_console_scripts_with_main_py():
+    """When both main.py AND [project.scripts] exist, main.py should come
+    first (it's the more reliable entrypoint) and the console script
+    should also be present as a fallback."""
+    repo = _make_repo({
+        "pyproject.toml": (
+            '[project.scripts]\nmytool = "mytool.cli:app"\n'
+        ),
+        "main.py": "print('hi')",
+        "mytool/__init__.py": "",
+    })
+    s = detect_stack(repo)
+    assert s is not None
+    # main.py should be first
+    assert s.run_candidates[0] == ["python", "main.py"], \
+        f"Expected python main.py first, got {s.run_candidates}"
+    # Console script should also be present
+    assert any("-c" in c for c in s.run_candidates), \
+        f"Expected python -c candidate too, got {s.run_candidates}"
+    print("[OK] detect_stack: Python (main.py first, [project.scripts] as fallback)")
+
+
 def test_detect_go():
     repo = _make_repo({"go.mod": "module x\ngo 1.22\n", "main.go": "package main\n"})
     s = detect_stack(repo)
@@ -820,6 +954,13 @@ def run_all():
     test_detect_python_pyproject_toml()
     test_detect_python_setup_py()
     test_detect_python_pyproject_no_main()
+    test_detect_python_console_scripts_pyproject()
+    test_detect_python_console_scripts_poetry()
+    test_detect_python_console_scripts_poetry_shorthand()
+    test_detect_python_console_scripts_dotted_attr()
+    test_detect_python_console_scripts_setup_cfg()
+    test_detect_python_console_scripts_setup_py()
+    test_detect_python_console_scripts_with_main_py()
     test_detect_go()
     test_detect_rust()
     test_detect_unknown()

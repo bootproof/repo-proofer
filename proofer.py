@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+__version__ = "0.2.0"
+
 # ----------------------------------------------------------------------
 # Missing-dependency guard — print a guided message instead of a raw
 # traceback. This is the first code that runs; if typer/rich/gitpython
@@ -403,55 +405,232 @@ def _detect_node_entrypoints(repo_path: Path) -> list[list[str]]:
     return candidates
 
 
+def _resolve_console_script(name: str, target: str) -> list[str]:
+    """Convert a console_scripts entry to a runnable `python -c` command.
+
+    Console scripts are declared as `name = "pkg.mod:func"` in
+    pyproject.toml [project.scripts] or setup.cfg console_scripts.
+    The standard generated wrapper does:
+        from pkg.mod import func
+        sys.exit(func())
+    We replicate that via `python -c` so we don't need to install the
+    package — just have it importable on PYTHONPATH.
+
+    Handles:
+      - "pkg.mod:func"       -> importlib.import_module('pkg.mod'); .func()
+      - "pkg.mod:obj.method" -> importlib.import_module('pkg.mod'); .obj.method()
+      - "pkg.mod" (Poetry)   -> treated as "pkg.mod:main" (Poetry convention)
+
+    Sets sys.argv=[name] so Click/Typer apps don't try to parse `-c`
+    as a CLI argument.
+    """
+    if ":" in target:
+        module, attr_path = target.split(":", 1)
+    else:
+        # Poetry shorthand: bare module means module:main
+        module, attr_path = target, "main"
+
+    # Build the Python -c code. Using importlib.import_module handles
+    # dotted module paths correctly. getattr chain handles dotted attrs.
+    code = (
+        f"import sys; sys.argv=['{name}']; "
+        f"import importlib; "
+        f"obj = importlib.import_module('{module}')"
+    )
+    for attr in attr_path.split("."):
+        code += f"; obj = getattr(obj, '{attr}')"
+    code += "; sys.exit(obj())"
+    return ["python", "-c", code]
+
+
+def _parse_toml_console_scripts(repo_path: Path) -> dict[str, str]:
+    """Parse pyproject.toml for console_scripts entries.
+
+    Returns {name: target} dict, e.g. {"mytool": "mytool.cli:app"}.
+    Handles both PEP 621 [project.scripts] and Poetry [tool.poetry.scripts].
+
+    Uses tomllib (3.11+) or tomli (3.10) if available; falls back to a
+    regex parser for 3.10 without tomli installed.
+    """
+    pyproject = repo_path / "pyproject.toml"
+    if not pyproject.exists():
+        return {}
+    try:
+        text = pyproject.read_text()
+    except OSError:
+        return {}
+
+    # Try tomllib (stdlib 3.11+) or tomli (3.10 backport).
+    data = None
+    try:
+        import tomllib
+        data = tomllib.loads(text)
+    except ImportError:
+        try:
+            import tomli
+            data = tomli.loads(text)
+        except ImportError:
+            pass  # Fall through to regex
+
+    if data is not None:
+        scripts: dict[str, str] = {}
+        # PEP 621: [project.scripts]
+        project_scripts = data.get("project", {}).get("scripts", {})
+        if isinstance(project_scripts, dict):
+            scripts.update(project_scripts)
+        # Poetry: [tool.poetry.scripts]
+        poetry_scripts = data.get("tool", {}).get("poetry", {}).get("scripts", {})
+        if isinstance(poetry_scripts, dict):
+            scripts.update(poetry_scripts)
+        return scripts
+
+    # Regex fallback for 3.10 without tomli.
+    return _regex_parse_toml_scripts(text)
+
+
+def _regex_parse_toml_scripts(text: str) -> dict[str, str]:
+    """Fallback regex parser for [project.scripts] / [tool.poetry.scripts]."""
+    scripts: dict[str, str] = {}
+    for table_name in ("project.scripts", "tool.poetry.scripts"):
+        # Match the table header and capture lines until the next [table].
+        pattern = rf'\[{re.escape(table_name)}\]\s*\n((?:[^\[]*))'
+        m = re.search(pattern, text)
+        if m:
+            for line in m.group(1).splitlines():
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    parts = line.split("=", 1)
+                    key = parts[0].strip().strip('"\'')
+                    val = parts[1].strip().strip('"\'')
+                    if key and val:
+                        scripts[key] = val
+    return scripts
+
+
+def _parse_setup_cfg_console_scripts(repo_path: Path) -> dict[str, str]:
+    """Parse setup.cfg [options.entry_points] console_scripts."""
+    setup_cfg = repo_path / "setup.cfg"
+    if not setup_cfg.exists():
+        return {}
+    try:
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read(setup_cfg)
+        if "options.entry_points" not in cp:
+            return {}
+        ep_text = cp["options.entry_points"].get("console_scripts", "")
+        scripts: dict[str, str] = {}
+        for line in ep_text.strip().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                parts = line.split("=", 1)
+                key = parts[0].strip()
+                val = parts[1].strip()
+                if key and val:
+                    scripts[key] = val
+        return scripts
+    except Exception:
+        return {}
+
+
+def _parse_setup_py_console_scripts(repo_path: Path) -> dict[str, str]:
+    """Regex-parse setup.py for console_scripts entry_points.
+
+    setup.py is arbitrary Python, so we can't fully parse it. We regex
+    for the common `console_scripts` list pattern. This is deliberately
+    conservative — it only matches within a console_scripts context.
+    """
+    setup_py = repo_path / "setup.py"
+    if not setup_py.exists():
+        return {}
+    try:
+        text = setup_py.read_text()
+    except OSError:
+        return {}
+
+    scripts: dict[str, str] = {}
+    # Find console_scripts blocks and parse entries from them.
+    # Matches: console_scripts=[...] or console_scripts: [...]
+    cs_pattern = r'console_scripts["\']?\s*[=:]\s*\[([^\]]+)\]'
+    for cs_match in re.finditer(cs_pattern, text):
+        section = cs_match.group(1)
+        entry_pattern = r'["\'](\w[\w-]*)\s*=\s*([\w.]+(?::[\w.]+)?)["\']'
+        for m in re.finditer(entry_pattern, section):
+            scripts[m.group(1)] = m.group(2)
+    return scripts
+
+
 def _detect_python_entrypoints(repo_path: Path) -> list[list[str]]:
     """Pick Python entrypoints by scanning for common boot files.
 
-    Covers:
-      - main.py / app.py at root          (scripts)
-      - server.py / run.py at root        (servers, launchers)
-      - manage.py at root                 (Django — run with `check` to
-                                           verify the project loads)
-      - src/main.py / src/app.py          (src-layout packages)
-      - __main__.py at root or in a top-  (python -m <pkg>)
-        level package dir
+    Covers (in priority order):
+      1. main.py / app.py / server.py / run.py at root  (scripts)
+      2. manage.py at root                              (Django — run `check`)
+      3. src/main.py / src/app.py                       (src-layout packages)
+      4. __main__.py at root or in a top-level dir      (python -m <pkg>)
+      5. [project.scripts] in pyproject.toml            (modern CLI entry points)
+         [tool.poetry.scripts] in pyproject.toml          (Poetry)
+         console_scripts in setup.cfg / setup.py          (legacy)
+
+    Item 5 is the fix for the "modern CLI mislabeled as library" bug:
+    a Typer/Click app that declares its entrypoint ONLY in
+    [project.scripts] (no main.py) was coming back with empty candidates
+    and getting the yellow library verdict. Now we parse the scripts
+    table and resolve `pkg.mod:func` to a runnable `python -c` command.
 
     Django's `manage.py` with no args exits non-zero (prints usage), so
     for manage.py we run `manage.py check` which exits 0 if the Django
-    project is correctly wired. That's the right "does it boot" test
-    for a Django repo.
+    project is correctly wired.
     """
     candidates: list[list[str]] = []
 
-    # Root-level scripts.
+    # 1. Root-level scripts.
     for f in ("main.py", "app.py", "server.py", "run.py"):
         if (repo_path / f).exists():
             candidates.append(["python", f])
 
-    # Django — `manage.py check` verifies the project loads.
+    # 2. Django — `manage.py check` verifies the project loads.
     if (repo_path / "manage.py").exists():
         candidates.append(["python", "manage.py", "check"])
 
-    # src-layout.
+    # 3. src-layout.
     for f in ("src/main.py", "src/app.py"):
         if (repo_path / f).exists():
             candidates.append(["python", f])
 
-    # python -m <pkg> via __main__.py.
+    # 4. python -m <pkg> via __main__.py.
     if (repo_path / "__main__.py").exists():
         candidates.append(["python", "__main__.py"])
     else:
         # Look for a top-level dir with __main__.py — that's `python -m <pkg>`.
-        # We do NOT require __init__.py: PEP 420 namespace packages (dirs
-        # with __main__.py but no __init__.py) are valid `python -m` targets.
-        # Requiring __init__.py was a bug that caused namespace-package repos
-        # to come back with empty candidates and get mislabeled as slop.
+        # Do NOT require __init__.py: PEP 420 namespace packages are valid.
         for entry in sorted((repo_path).iterdir()):
             if entry.is_dir() and not entry.name.startswith('.') \
                     and (entry / "__main__.py").exists():
                 candidates.append(["python", "-m", entry.name])
                 break  # one is enough; deterministic via sorted()
 
-    return candidates
+    # 5. Console scripts from pyproject.toml / setup.cfg / setup.py.
+    # This is how modern Python CLIs declare their entrypoint — not via
+    # main.py, but via [project.scripts] in pyproject.toml. Without this,
+    # a real CLI (Typer/Click app with a console_scripts entry, no main.py)
+    # would be mislabeled as a library (yellow NO RUNNABLE ENTRYPOINT).
+    console_scripts: dict[str, str] = {}
+    console_scripts.update(_parse_toml_console_scripts(repo_path))
+    console_scripts.update(_parse_setup_cfg_console_scripts(repo_path))
+    console_scripts.update(_parse_setup_py_console_scripts(repo_path))
+    for name, target in sorted(console_scripts.items()):
+        candidates.append(_resolve_console_script(name, target))
+
+    # Dedup while preserving order.
+    seen: set[tuple[str, ...]] = set()
+    unique: list[list[str]] = []
+    for c in candidates:
+        t = tuple(c)
+        if t not in seen:
+            seen.add(t)
+            unique.append(c)
+    return unique
 
 
 def detect_stack(repo_path: Path) -> Optional[StackProfile]:
@@ -512,6 +691,7 @@ def detect_stack(repo_path: Path) -> Optional[StackProfile]:
         (repo_path / "requirements.txt").exists()
         or (repo_path / "pyproject.toml").exists()
         or (repo_path / "setup.py").exists()
+        or (repo_path / "setup.cfg").exists()
         or has_python_entry
     )
     if has_python_marker:

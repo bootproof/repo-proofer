@@ -44,3 +44,5 @@ Thumbs.db
 # the fixtures locally so proofer.py can clone them via file:// URLs.
 # The .git directories themselves should never be committed.
 tests/fixtures/*/.git/
+dist/
+*.egg-info/

@@ -27,7 +27,7 @@ If the app tries to read `~/.ssh/id_rsa` while the network is blocked, the verdi
 
 - **Zero AI.** Pure subprocess + filesystem + strace. Deterministic, fast, free to run forever.
 - **Hardened sandbox.** `--rm --read-only --network none --cap-drop ALL --memory 512m --cpus 0.5 --tmpfs /tmp`. The repo is mounted `:ro`. No exceptions.
-- **Stack auto-detection.** Node.js, Python, Go (experimental), Rust (experimental) — picked by file-existence (`package.json`, `requirements.txt`/`pyproject.toml`/`setup.py`/`main.py`, `go.mod`, `Cargo.toml`).
+- **Stack auto-detection.** Node.js, Python, Go (experimental), Rust (experimental) — picked by file-existence (`package.json`, `requirements.txt`/`pyproject.toml`/`setup.py`/`setup.cfg`/`main.py`, `go.mod`, `Cargo.toml`). Python entrypoints are resolved from `[project.scripts]` / `console_scripts` (modern CLI apps), `manage.py`, `src/` layouts, `__main__.py`, and conventional files — so a real Typer/Click CLI that declares its entrypoint only in `pyproject.toml` is correctly detected as runnable, not mislabeled as a library.
 - **Runtime Behavior Report.** When enabled (default), the entrypoint is wrapped in `strace -ff` inside the sandbox. After execution you get an SBOM-style report based on *actual execution, not static guessing*:
   - Files Read
   - Files Written
@@ -81,7 +81,7 @@ Supported stacks and their base images:
 | Marker file                          | Stack                | Image                | Status       |
 |--------------------------------------|----------------------|----------------------|--------------|
 | `package.json`                       | Node.js              | `node:20-slim`       | Supported    |
-| `requirements.txt` / `pyproject.toml` / `setup.py` / `main.py` / `server.py` / `manage.py` | Python | `python:3.11-slim` | Supported |
+| `requirements.txt` / `pyproject.toml` / `setup.py` / `setup.cfg` / `main.py` / `server.py` / `manage.py` / `[project.scripts]` | Python | `python:3.11-slim` | Supported |
 | `go.mod`                             | Go                   | `golang:1.22-alpine` | Experimental |
 | `Cargo.toml`                         | Rust                 | `rust:1.75-slim`     | Experimental |
 
@@ -261,9 +261,11 @@ This tool is honest about what it can and can't do. The gaps below are real; wor
 - [x] Phase 1: Open-source CLI (this repo)
 - [x] `uvx` / `pipx` packaging (`pyproject.toml` + console script)
 - [x] Three-color verdict system (green/red/yellow — libraries are not slop)
+- [x] Console-script entrypoint detection (`[project.scripts]` / `console_scripts`)
+- [ ] Publish to PyPI (see [PUBLISH.md](PUBLISH.md) — package builds, publish is one command)
+- [ ] Docker-optional native sandbox (see [docs/DOCKER_OPTIONAL.md](docs/DOCKER_OPTIONAL.md) — the adoption-tax fix)
 - [ ] Phase 2: Cloud API + runtime-behavior database
 - [ ] Phase 3: Enterprise CI/CD gate (GitHub Actions / GitLab CI plugin)
-- [ ] Non-Docker sandbox mode (bubblewrap/nsjail) for zero-install consumer triage
 
 ---
 
